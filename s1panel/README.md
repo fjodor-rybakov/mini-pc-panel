@@ -80,6 +80,20 @@ sudo snap remove s1panel
 > [!NOTE]
 > For disk space monitoring, please check the s1panel log after restarting the service. You will find the lsblk output there, which you can use to determine the mappings between the Snap and the host system.
 
+## Install (Docker)
+
+A multi-stage `Dockerfile` is provided at the repo root. It builds the panel the same way the snap build does (ubuntu 24.04, the same packages, Node LTS, native modules compiled with `--build-from-source`), so it also doubles as a fast build check without running snapcraft. The Node version can be overridden with `--build-arg NODE_VERSION=...`.
+
+Build from the repo root (the image targets linux/amd64, the S1 Mini PC arch):
+
+```
+docker build -t s1panel .
+docker run -d --name s1panel --restart unless-stopped \
+    --device /dev/bus/usb --device /dev/ttyUSB0 \
+    -v s1panel-data:/data -p 8686:8686 s1panel
+```
+
+The web GUI is served on port 8686 (the `listen` entry in `config.json`). On first start, `config.json` and the themes are seeded into the `/data` volume; edit them there or through the web GUI. Talking to the LCD requires the USB bus passed through (`--device /dev/bus/usb`), and the LED strip its serial device (`--device /dev/ttyUSB0`); add `--privileged` if the sensors need more host access.
 
 ## Dependencies
 
@@ -92,9 +106,9 @@ sudo apt install npm
 
 ```
 $ node -v
-v18.13.0
+v26.13.1
 $ npm -v
-9.2.0
+11.20.0
 ```
 
 > [!NOTE]

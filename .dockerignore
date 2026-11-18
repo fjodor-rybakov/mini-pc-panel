@@ -1,0 +1,12 @@
+.git
+.github
+images
+*.snap
+LICENSE
+README.md
+s1panel/README.md
+s1panel/install
+s1panel/snap
+s1panel/node_modules
+s1panel/gui/node_modules
+s1panel/gui/dist
