@@ -16,9 +16,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/render"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/render"
 )
 
 //go:embed web

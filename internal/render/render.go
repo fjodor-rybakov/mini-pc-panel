@@ -10,8 +10,8 @@ import (
 	"image/png"
 	"io"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 	"github.com/tdewolff/canvas"
 	"github.com/tdewolff/canvas/renderers/rasterizer"
 )

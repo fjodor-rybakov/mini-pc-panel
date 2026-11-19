@@ -11,10 +11,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/app"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/display"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/server"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/app"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/display"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/server"
 )
 
 func main() {

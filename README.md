@@ -1,14 +1,17 @@
 # s1panel — переписано с Node.js на Go
 
-Go-деemon для AceMagic S1 LED-TFT панели (VID `0x04D9`, PID `0xFD01`): экран 320×170
+Go-демон для AceMagic S1 LED-TFT панели (VID `0x04D9`, PID `0xFD01`): экран 320×170
 по HID (интерфейс MI_01) + LED-подсветка по CH340 (последовательный порт).
 Переписан с оригинального Node.js-проекта `mini-pc-panel` строго по протоколу
-из `doc/revrite.md` (§2), плюс браузерный редактор виджетов телеметрии.
+из [`doc/revrite.md`](doc/revrite.md) (§2), плюс браузерный редактор виджетов
+телеметрии. Оригинальное Node.js-приложение, snap- и Node-Docker-сборки и
+картинки удалены из репозитория 2026-11-19 — проект существует только как это
+Go-переписывание (всё удалённое — в истории git).
 
 ## Структура
 
 ```
-golang/
+./ (корень репозитория)
 ├── cmd/s1panel/main.go      демон: флаги, сигнал SIGINT/SIGTERM, запуск цикла и админки
 ├── internal/config/         config.json + тема экранов (валидация, дефолты, сохранение)
 ├── internal/display/        протокол HID (пакеты) + очередь/один воркер (10 мс пауза)
@@ -50,7 +53,6 @@ cp config.example.json config.json   # поправить sensors/fonts под �
 ### Docker
 
 ```sh
-cd golang
 docker build -t s1panel .
 docker compose up -d --build   # готовый вариант с devices/volumes
 ```
@@ -58,8 +60,9 @@ docker compose up -d --build   # готовый вариант с devices/volume
 При первом запуске в том `/etc/s1panel` засевается `config.json` (из
 `config.example.json`) и каталог `themes/`. Контейнеру нужны устройства
 панели и подсветки: `--device /dev/hidraw0 --device /dev/ttyUSB0`
-(номер hidraw находит `grep -l 04d9 /sys/class/hidraw/*/device/uevent`;
-при «плавающем» номере — udev-силинка, см. `docker-compose.yml`). Хостовые
+(нужен узел **MI_01** — у панели два hidraw-узла, правильный тот, у чего
+`readlink -f /sys/class/hidraw/hidrawN/device` оканчивается на `:1.1`;
+при «плавающем» номере — udev-силинка, см. ниже). Хостовые
 датчики видны как есть (`/sys/class/hwmon` в контейнере read-only), а
 `sensors.mount_points` меряет монтирования внутри контейнера — конфиг под
 контейнер обычно стоит поправить.
@@ -76,6 +79,9 @@ docker compose up -d --build   # готовый вариант с devices/volume
 
 ```
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", MODE="0660", GROUP="plugdev"
+# закрепить экран (MI_01) отдельным именем: номера hidrawN «плавают»,
+# а у панели два интерфейса (MI_00 клавиатура + MI_01 экран)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", ATTRS{bInterfaceNumber}=="01", SYMLINK+="s1panel-hidraw"
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666"
 ```
 
@@ -83,6 +89,13 @@ KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev $USER   # перелогиниться
 ```
+
+Если демон не находит интерфейс по номеру (`display: 04d9:fd01 enumerated
+but none of its interfaces is 1 [found: ...]` — hidapi не смог прочитать
+номера интерфейсов из sysfs, бывает в контейнерах), узел закрепляется прямо
+в конфиге: `"device": { "path": "/dev/s1panel-hidraw" }` (или `/dev/hidrawN`,
+у которого `readlink -f /sys/class/hidraw/hidrawN/device` оканчивается на
+`:1.1`). При заданном `path` `vid`/`pid`/`interface` не участвуют в поиске.
 
 ### systemd
 

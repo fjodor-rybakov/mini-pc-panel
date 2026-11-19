@@ -48,6 +48,11 @@ type DeviceConfig struct {
 	VID       HexUint16 `json:"vid"`
 	PID       HexUint16 `json:"pid"`
 	Interface int       `json:"interface"` // MI_01 -> 1 (spec §2)
+	// Path optionally pins an explicit device node (/dev/hidrawN or a udev
+	// symlink such as /dev/s1panel-hidraw). When set, it is opened directly
+	// and vid/pid/interface are not used for finding the device — escape
+	// hatch for containers where hidapi cannot read interface numbers.
+	Path string `json:"path"`
 }
 
 // LEDSettings are config-file values in the user scale used by the original

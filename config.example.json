@@ -2,7 +2,8 @@
   "device": {
     "vid": "0x04D9",
     "pid": "0xFD01",
-    "interface": 1
+    "interface": 1,
+    "path": ""
   },
   "led": {
     "port": "/dev/ttyUSB0",

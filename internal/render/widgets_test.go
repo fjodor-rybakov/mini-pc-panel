@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 )
 
 // Pixel-level fidelity tests for the widget renderers ported from the

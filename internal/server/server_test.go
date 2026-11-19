@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/render"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/render"
 )
 
 const validDraft = `{"orientation":"landscape","screens":[{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":0,"y":0,"width":50,"height":16},"sensor":"cpu","format":"{0}"}]}]}`

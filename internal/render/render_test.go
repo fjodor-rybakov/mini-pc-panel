@@ -7,8 +7,8 @@ import (
 	"image/png"
 	"testing"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 )
 
 // Spec §3: RGB565 big-endian byte order.

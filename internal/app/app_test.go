@@ -3,7 +3,7 @@ package app
 import (
 	"testing"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
 )
 
 func TestDeviceRectLandscapeIsIdentity(t *testing.T) {

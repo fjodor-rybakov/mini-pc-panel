@@ -1,0 +1,21 @@
+# Запуск из корня репозитория:  docker compose up -d --build
+services:
+  s1panel:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8686:8686"        # редактор/админка ("listen" в конфиге)
+    volumes:
+      - ./panel-data:/etc/s1panel   # конфиг + темы (засеваются при первом запуске)
+    devices:
+      # панель — нужен узел MI_01 (экран): у него readlink -f
+      # /sys/class/hidraw/hidrawN/device оканчивается на ":1.1"
+      # (второй hidraw-узел той же панели — MI_00, клавиатура)
+      - /dev/hidraw0
+      # LED-лента CH340
+      - /dev/ttyUSB0
+    # Если hidraw-номер «плавает», закрепите его udev-силинкой
+    # (SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01",
+    #  ATTRS{bInterfaceNumber}=="01", SYMLINK+="s1panel-hidraw")
+    # и укажите /dev/s1panel-hidraw здесь — либо "device.path" в конфиге
+    # (он открывает узел напрямую, минуя определение интерфейса).

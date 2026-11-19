@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/display"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/led"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/metrics"
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/render"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/display"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/led"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/render"
 )
 
 // previewHold keeps an editor preview visible on the real panel long enough
@@ -47,7 +47,13 @@ type App struct {
 // A missing LED port is a soft failure (the panel still works), matching the
 // original led_thread.js tolerance.
 func New(cfg *config.Config) (*App, error) {
-	tr, err := display.OpenHID(uint16(cfg.Device.VID), uint16(cfg.Device.PID), cfg.Device.Interface)
+	var tr display.Transport
+	var err error
+	if cfg.Device.Path != "" {
+		tr, err = display.OpenPath(cfg.Device.Path)
+	} else {
+		tr, err = display.OpenHID(uint16(cfg.Device.VID), uint16(cfg.Device.PID), cfg.Device.Interface)
+	}
 	if err != nil {
 		return nil, err
 	}

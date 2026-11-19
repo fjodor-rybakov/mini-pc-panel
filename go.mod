@@ -1,4 +1,4 @@
-module github.com/fjodor-rybakov/mini-pc-panel/golang
+module github.com/fjodor-rybakov/mini-pc-panel
 
 go 1.27.1
 

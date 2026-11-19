@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/fjodor-rybakov/mini-pc-panel/golang/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
 	"github.com/go-fonts/latin-modern/lmsans10bold"
 	"github.com/go-fonts/latin-modern/lmsans10regular"
 	"github.com/tdewolff/canvas"

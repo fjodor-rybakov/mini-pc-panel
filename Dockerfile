@@ -10,7 +10,7 @@
 #       -v ./panel-data:/etc/s1panel -p 8686:8686 s1panel
 #
 # Вариант с compose — docker-compose.yml рядом.
-# Контекст сборки — каталог golang/ (go.mod находится здесь).
+# Контекст сборки — корень репозитория (go.mod лежит в нём).
 
 ########## build stage ##########
 FROM golang:1.27-bookworm AS build
