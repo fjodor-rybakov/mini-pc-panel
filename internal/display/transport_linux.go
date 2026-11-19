@@ -45,14 +45,18 @@ func OpenHID(vid, pid uint16, iface int) (Transport, error) {
 		return nil, fmt.Errorf("display: enumerate %04x:%04x: %w", vid, pid, err)
 	}
 	if path == "" {
-		if node := probeScreenHidraw(vid, pid); node != "" {
+		node, diag := probeScreenHidraw(vid, pid)
+		if node != "" {
 			return openHIDPath(node)
 		}
 		hid.Exit()
-		if len(seen) == 0 {
-			return nil, fmt.Errorf("display: no HID device %04x:%04x enumerated and sysfs probing found no hidraw node with a %d-byte output report (panel not plugged in, or invisible here — check lsusb; in Docker, whether /sys is the host sysfs)", vid, pid, PacketSize)
+		if diag == "" {
+			diag = fmt.Sprintf("no hidraw node with %04x:%04x in its uevent/modalias under /sys/class/hidraw", vid, pid)
 		}
-		return nil, fmt.Errorf("display: %04x:%04x enumerated but no interface %d among [%s], and sysfs report-descriptor probing found no screen node either — set device.path in config.json, trying each of the panel's /dev/hidrawN in turn", vid, pid, iface, strings.Join(seen, ", "))
+		if len(seen) == 0 {
+			return nil, fmt.Errorf("display: no HID device %04x:%04x enumerated and sysfs found no screen node either [%s] (panel not plugged in, or invisible here — check lsusb; in Docker, whether /sys is the host sysfs)", vid, pid, diag)
+		}
+		return nil, fmt.Errorf("display: %04x:%04x enumerated but no interface %d among [%s], and sysfs probing [%s] found no hidraw node with a %d-byte output report — set device.path in config.json, trying each of the panel's /dev/hidrawN in turn", vid, pid, iface, strings.Join(seen, ", "), diag, PacketSize)
 	}
 	return openHIDPath(path)
 }
@@ -102,17 +106,25 @@ func (t *hidTransport) Close() error { return t.dev.Close() }
 // interface -1). In Docker /sys is the host sysfs, so the probe still sees
 // every node; opening one that was not passed with --device then fails with
 // a clear display: open error.
-func probeScreenHidraw(vid, pid uint16) string {
+//
+// The second return value accounts for every candidate the probe touched
+// (output-report sizes, read failures) so a failure in the log states WHY
+// nothing matched — unrecognised uevent format, missing report_descriptor
+// attribute, or a screen report the parser did not find are three different
+// problems and need three different fixes.
+func probeScreenHidraw(vid, pid uint16) (path, diag string) {
 	const minScreenBits = PacketSize * 8
 	entries, err := os.ReadDir("/sys/class/hidraw")
 	if err != nil {
-		return ""
+		return "", fmt.Sprintf("cannot read /sys/class/hidraw: %v", err)
 	}
 	best, bestBits := "", 0
+	var seen []string
 	for _, e := range entries {
 		dir := "/sys/class/hidraw/" + e.Name() + "/device/"
 		uevent, err := os.ReadFile(dir + "uevent")
 		if err != nil {
+			seen = append(seen, fmt.Sprintf("%s: uevent unreadable (%v)", e.Name(), err))
 			continue
 		}
 		u, p, ok := matchProductUEvent(string(uevent))
@@ -121,13 +133,16 @@ func probeScreenHidraw(vid, pid uint16) string {
 		}
 		rd, err := os.ReadFile(dir + "report_descriptor")
 		if err != nil {
+			seen = append(seen, fmt.Sprintf("%s: report_descriptor unreadable (%v)", e.Name(), err))
 			continue
 		}
-		if bits := maxOutputReportBits(rd); bits >= minScreenBits && bits > bestBits {
+		bits := maxOutputReportBits(rd)
+		seen = append(seen, fmt.Sprintf("%s: %d-bit output report (%d-byte descriptor)", e.Name(), bits, len(rd)))
+		if bits >= minScreenBits && bits > bestBits {
 			best, bestBits = "/dev/"+e.Name(), bits
 		}
 	}
-	return best
+	return best, strings.Join(seen, "; ")
 }
 
 // Shutdown releases the HID subsystem; call once after the last Display close.

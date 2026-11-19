@@ -52,25 +52,46 @@ func maxOutputReportBits(desc []byte) int {
 	return maxBits
 }
 
-// matchProductUEvent parses the "PRODUCT=<vid>/<pid>/<rev>" line of a HID
-// device uevent (kernel writes plain lowercase hex without leading zeros,
-// e.g. "PRODUCT=4d9/fd01/1102").
+// matchProductUEvent extracts VID/PID from a HID device uevent. The
+// "PRODUCT=<vid>/<pid>/<rev>" line (lowercase hex, no leading zeros, e.g.
+// "PRODUCT=4d9/fd01/1102") is preferred, but it is only present on newer
+// kernels — older HID uevents carry just MODALIAS/HID_ID/HID_NAME — so the
+// always-present "MODALIAS=hid:b0000v04D9pFD01e0110" line is the fallback.
 func matchProductUEvent(uevent string) (vid, pid uint16, ok bool) {
+	mVid, mPid, mOK := uint16(0), uint16(0), false
 	for _, line := range strings.Split(uevent, "\n") {
-		v, found := strings.CutPrefix(strings.TrimSpace(line), "PRODUCT=")
-		if !found {
-			continue
+		line = strings.TrimSpace(line)
+		if v, found := strings.CutPrefix(line, "PRODUCT="); found {
+			parts := strings.Split(v, "/")
+			if len(parts) < 2 {
+				continue
+			}
+			u, err1 := strconv.ParseUint(parts[0], 16, 16)
+			p, err2 := strconv.ParseUint(parts[1], 16, 16)
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			return uint16(u), uint16(p), true
 		}
-		parts := strings.Split(v, "/")
-		if len(parts) < 2 {
-			continue
+		if v, found := strings.CutPrefix(line, "MODALIAS="); found && !mOK {
+			mVid, mPid, mOK = parseHIDModalias(v)
 		}
-		u, err1 := strconv.ParseUint(parts[0], 16, 16)
-		p, err2 := strconv.ParseUint(parts[1], 16, 16)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		return uint16(u), uint16(p), true
 	}
-	return 0, 0, false
+	return mVid, mPid, mOK
+}
+
+// parseHIDModalias parses "hid:b<bus>v<vid>p<pid>e<rev>" — every field is
+// exactly four hex digits, zero-padded by the kernel.
+func parseHIDModalias(v string) (vid, pid uint16, ok bool) {
+	i := strings.Index(v, "v")
+	j := strings.Index(v, "p")
+	if !strings.HasPrefix(v, "hid:b") || i < 0 || j < i+5 || j+5 > len(v) {
+		return 0, 0, false
+	}
+	u, err1 := strconv.ParseUint(v[i+1:i+5], 16, 16)
+	p, err2 := strconv.ParseUint(v[j+1:j+5], 16, 16)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return uint16(u), uint16(p), true
 }

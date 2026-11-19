@@ -46,4 +46,15 @@ func TestMatchProductUEvent(t *testing.T) {
 	if _, _, ok := matchProductUEvent("HID_NAME=no product line\n"); ok {
 		t.Error("uevent without PRODUCT line must not match")
 	}
+	// Older kernels: no PRODUCT= line in HID uevents, MODALIAS= only.
+	vid, pid, ok = matchProductUEvent("HID_NAME=ACE MAGIC S1\nHID_ID=0003000004D90000FD01\nMODALIAS=hid:b0000v04D9pFD01e0110\n")
+	if !ok || vid != 0x04D9 || pid != 0xFD01 {
+		t.Errorf("modalias-only uevent: got vid=%04x pid=%04x ok=%v", vid, pid, ok)
+	}
+	if _, _, ok := matchProductUEvent("MODALIAS=hid:b0003v12pABCD0e0001\nHID_NAME=Mouse\n"); ok {
+		t.Error("malformed modalias must not match")
+	}
+	if vid, pid, ok = parseHIDModalias("hid:b0005v0A0Bp0C0De0F0E"); !ok || vid != 0x0A0B || pid != 0x0C0D {
+		t.Errorf("parseHIDModalias: got vid=%04x pid=%04x ok=%v", vid, pid, ok)
+	}
 }
