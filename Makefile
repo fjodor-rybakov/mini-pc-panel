@@ -9,7 +9,9 @@ all: build
 build:
 	CGO_ENABLED=1 $(GO) build -o $(BIN) ./cmd/s1panel
 
-# Spec §1: the tree must also compile with the libusb backend
+# Spec §1: the tree must also compile with the libusb backend.
+# REQUIRED backend for newer panel firmware (under-declared output report —
+# kernel hidraw rejects the 4105-byte writes); the Docker build uses this.
 build-libusb:
 	CGO_ENABLED=1 $(GO) build -tags libusb -o bin/s1panel-libusb ./cmd/s1panel
 

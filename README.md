@@ -22,7 +22,7 @@ Go-переписывание (всё удалённое — в истории g
 ├── internal/server/         HTTP-админка: редактор + API (embed web/)
 ├── Dockerfile               docker-сборка: 2 этапа (cgo+hidapi → debian-slim)
 ├── docker-entrypoint.sh     засев config.json/тем в том при первом запуске
-├── docker-compose.yml       запуск с --device панели и CH340
+├── docker-compose.yml       запуск с доступом к USB-шине (libusb) и CH340
 ├── config.example.json      пример конфигурации (значения = дефолты кода)
 └── themes/demo.json         демо-тема (2 экрана, сеточные координаты)
 ```
@@ -33,10 +33,19 @@ Go-переписывание (всё удалённое — в истории g
 (backend libusb), `make`.
 
 ```sh
-make build         # backend hidraw (по умолчанию), bin/s1panel
-make build-libusb  # -tags libusb (обязательная проверка по §1)
+make build         # backend hidraw, bin/s1panel
+make build-libusb  # backend libusb (-tags libusb), bin/s1panel-libusb
 make test vet fmt  # тесты, vet, gofmt
 ```
+
+**Какую панель какой бэкенд берёт:** оригинальное Node.js-приложение
+работало только через libusb (`node_hid.setDriverType('libusb')`,
+`lcd_thread.js:14`), и Docker-сборка повторяет это — `go build
+-tags libusb`. У прошивок новых ревизий screen-интерфейс объявляет в
+report-дескрипторе output-отчёт меньше кадра (наблюдалось 512 бит для
+4104-байтных пакетов); ядро через hidraw запись большего размера
+отвергает, так что на хосте для таких панелей — `make build-libusb`.
+Для панелей оригинальной ревизии работает и hidraw-сборка.
 
 `github.com/sstallion/go-hid` — cgo-библиотека, поэтому кросс-сборка с Windows
 не работает (на Windows собирается только stub-транспорт, остальные пакеты и
@@ -58,11 +67,11 @@ docker compose up -d --build   # готовый вариант с devices/volume
 ```
 
 При первом запуске в том `/etc/s1panel` засевается `config.json` (из
-`config.example.json`) и каталог `themes/`. Контейнеру нужны устройства
-панели и подсветки: `--device /dev/hidraw0 --device /dev/ttyUSB0`
-(лучше передавать **все** hidraw-узлы панели — `grep -l 4d9
-/sys/class/hidraw/*/device/uevent`: экранный узел зависит от ревизии
-прошивки, демон выберет его сам, см. примечание в udev-разделе). Хостовые
+`config.example.json`) и каталог `themes/`. Образ собран с libusb-бэкендом,
+поэтому hidraw-узлы панели контейнеру не нужны — нужен доступ к USB-шине
+(compose: монтирование `/dev/bus/usb` + `device_cgroup_rules: c 189:* rwm`,
+см. `docker run`-пример в шапке `Dockerfile`) и подсветке
+`--device /dev/ttyUSB0`. Хостовые
 датчики видны как есть (`/sys/class/hwmon` в контейнере read-only), а
 `sensors.mount_points` меряет монтирования внутри контейнера — конфиг под
 контейнер обычно стоит поправить.
@@ -78,9 +87,13 @@ docker compose up -d --build   # готовый вариант с devices/volume
 `/etc/udev/rules.d/99-s1panel.rules`:
 
 ```
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", MODE="0660", GROUP="plugdev"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", MODE="0660", GROUP="plugdev"
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666"
 ```
+
+Первая строка нужна libusb-сборке (доступ к `/dev/bus/usb/…`), вторая —
+hidraw-сборке.
 
 ```sh
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -89,15 +102,21 @@ sudo usermod -aG plugdev $USER   # перелогиниться
 
 Прошивки панелей различаются: у оригинальных экран сидит на HID-интерфейсе
 MI_01 (`:1.1` — так и было в оригинальном `config.json`: `"device":
-"1-8:1.1"`), у других ревизий hidraw-узлы панели — это `:1.0` и `:1.2`
-(узла MI_01 нет вовсе), а hidapi иногда не может прочитать номера
-интерфейсов вообще. Демон справляется сам: если заданного `interface` нет в
-перечислении, он выбирает из hidraw-узлов панели тот, у которого в
-report-дескрипторе output-отчёт на 4104 байта — такой только у экранного
-интерфейса (`internal/display/report_desc.go`). Вручную узел закрепляется
-прямо в конфиге: `"device": { "path": "/dev/hidrawN" }` (перебором узлов —
-экранный тот, от которого панель оживает); при заданном `path`
-`vid`/`pid`/`interface` в поиске не участвуют.
+"1-8:1.1"`), у других ревизий интерфейсы панели — это `:1.0` и `:1.2`
+(узла MI_01 нет вовсе). Демон справляется сам: если заданного `interface`
+нет в перечислении, он по sysfs определяет, какой интерфейс панели —
+экранный: только у него в report-дескрипторе есть output-отчёт (у кнопок
+его нет), и открывает этот интерфейс уже своим бэкендом — hidraw или
+libusb (`internal/display/report_desc.go`). Важная оговорка: новые
+прошивки занижают размер output-отчёта в дескрипторе (наблюдалось 512 бит
+при рабочих 4104-байтных кадрах), поэтому hidraw-сборка на них открывает
+узел, но не может записать кадр — нужен libusb-бэкенд (`make build-libusb`,
+в Docker он уже по умолчанию), ровно как в оригинале
+(`setDriverType('libusb')`). Вручную интерфейс закрепляется прямо в
+конфиге: `"device": { "path": "…" }` — формат пути зависит от бэкенда
+(hidraw: `/dev/hidrawN`; libusb: путь из перечисления, его печатает строка
+`iface N at <путь>` в логе ошибки); при заданном `path` `vid`/`pid`/
+`interface` в поиске не участвуют.
 
 ### systemd
 

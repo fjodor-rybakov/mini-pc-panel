@@ -1,12 +1,20 @@
 # syntax=docker/dockerfile:1
 #
 # Docker-сборка Go-демона s1panel: два этапа — сборка на golang (cgo +
-# hidapi/udev/libusb dev-пакеты) и рантайм на debian-slim (hidraw-библиотеки,
-# шрифты DejaVu — на них ссылается config.json).
+# libusb dev-пакеты) и рантайм на debian-slim (libusb-1.0, шрифты DejaVu —
+# на них ссылается config.json).
+#
+# Бэкенд — libusb (-tags libusb), как в оригинальном Node.js-приложении
+# (setDriverType('libusb')). Прошивки новых ревизий объявляют в
+# report-дескрипторе output-отчёт меньше кадра (наблюдалось 512 бит вместо
+# 4104 байт), и ядро через hidraw такую запись не пропускает — libusb
+# работает с USB-эндпоинтом напрямую, минуя hidraw. Поэтому hidraw-узлы
+# (--device /dev/hidrawN) контейнеру не нужны, нужен доступ к USB-шине:
 #
 #   docker build -t s1panel .
 #   docker run -d --name s1panel --restart unless-stopped \
-#       --device /dev/hidraw0 --device /dev/ttyUSB0 \
+#       -v /dev/bus/usb:/dev/bus/usb --device-cgroup-rule 'c 189:* rwm' \
+#       --device /dev/ttyUSB0 \
 #       -v ./panel-data:/etc/s1panel -p 8686:8686 s1panel
 #
 # Вариант с compose — docker-compose.yml рядом.
@@ -16,7 +24,8 @@
 FROM golang:1.27-bookworm AS build
 ENV CGO_ENABLED=1
 
-# hidraw — бэкенд по умолчанию; libusb-1.0-0-dev нужен для -tags libusb (§1)
+# libusb — бэкенд этой сборки (-tags libusb, см. шапку); dev-пакеты hidapi/udev
+# остаются, чтобы в этом же образце можно было собрать и hidraw-вариант (§1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libc6-dev pkg-config \
         libhidapi-dev libudev-dev libusb-1.0-0-dev \
@@ -29,16 +38,16 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/s1panel ./cmd/s1panel
+RUN go build -tags libusb -trimpath -ldflags="-s -w" -o /out/s1panel ./cmd/s1panel
 
 ########## runtime stage ##########
 FROM debian:bookworm-slim
 
+# go-hid компилирует hidapi (hid.c) внутрь бинарника; libusb-сборке из
+# внешних библиотек нужен только libusb-1.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libhidapi-hidraw0 \
         libusb-1.0-0 \
-        libudev1 \
         fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 

@@ -80,6 +80,35 @@ func matchProductUEvent(uevent string) (vid, pid uint16, ok bool) {
 	return mVid, mPid, mOK
 }
 
+// parseHidIfaceFromSysfs extracts the USB interface number from a sysfs
+// device path or symlink target: the USB interface directory is named
+// "<busid>:<config>.<interface>" (e.g. ".../usb1/1-8/1-8:1.2/0003:...").
+// PCI segments ("0000:00:14.0") and HID-device segments
+// ("0003:04D9:FD01.0003") are skipped — their part after ':' contains
+// further ':' — so only the interface segment matches. Returns -1 when no
+// such segment is present.
+func parseHidIfaceFromSysfs(p string) int {
+	iface := -1
+	for _, seg := range strings.Split(p, "/") {
+		c := strings.IndexByte(seg, ':')
+		if c <= 0 {
+			continue
+		}
+		rest := seg[c+1:] // "1.2" for the interface segment
+		if strings.ContainsRune(rest, ':') {
+			continue
+		}
+		d := strings.IndexByte(rest, '.')
+		if d <= 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(rest[d+1:]); err == nil {
+			iface = n
+		}
+	}
+	return iface
+}
+
 // lastElem returns the final '/'-separated component of a path ("" for "").
 func lastElem(p string) string {
 	if i := strings.LastIndexByte(p, '/'); i >= 0 {

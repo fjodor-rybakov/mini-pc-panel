@@ -59,6 +59,24 @@ func TestMatchProductUEvent(t *testing.T) {
 	}
 }
 
+func TestParseHidIfaceFromSysfs(t *testing.T) {
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"../../devices/pci0000:00/0000:00:14.0/usb1/1-8/1-8:1.2/0003:04D9:FD01.0003", 2},
+		{"../../devices/platform/xhci-hcd/usb1/1-8/1-8:1.0/0003:04D9:FD01.0001", 0},
+		{"../../devices/.../usb2/2-1/2-1:1.1/0003:1A86:7523.0004", 1},
+		{"../../devices/pci0000:00/0000:00:14.0/usb1/1-8", -1}, // no interface segment
+		{"", -1},
+	}
+	for _, c := range cases {
+		if got := parseHidIfaceFromSysfs(c.path); got != c.want {
+			t.Errorf("parseHidIfaceFromSysfs(%q): got %d, want %d", c.path, got, c.want)
+		}
+	}
+}
+
 func TestLastElem(t *testing.T) {
 	if got := lastElem("../../devices/pci0000:00/usb1/1-2/1-2:1.2/0003:04D9:FD01.0003"); got != "0003:04D9:FD01.0003" {
 		t.Errorf("lastElem sysfs link: got %q", got)
