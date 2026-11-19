@@ -107,42 +107,67 @@ func (t *hidTransport) Close() error { return t.dev.Close() }
 // every node; opening one that was not passed with --device then fails with
 // a clear display: open error.
 //
-// The second return value accounts for every candidate the probe touched
-// (output-report sizes, read failures) so a failure in the log states WHY
-// nothing matched — unrecognised uevent format, missing report_descriptor
-// attribute, or a screen report the parser did not find are three different
-// problems and need three different fixes.
+// A node belongs to the panel if uevent says so (PRODUCT=/MODALIAS=) or —
+// the format-proof fallback — its sysfs device directory is named
+// "<bus>:<VENDOR>:<PRODUCT>.<instance>", which is how the HID core
+// registers every device on every kernel, whatever the uevent file looks
+// like there.
+//
+// The diag return accounts for everything the probe saw: matched nodes with
+// their output-report sizes, or — when nothing matched — every hidraw node
+// with the sysfs name the kernel gave it. A failure in the log then states
+// WHY: empty sysfs (host sysfs invisible to the process), unexpected uevent
+// format (the node names expose it), or unreadable report_descriptor.
 func probeScreenHidraw(vid, pid uint16) (path, diag string) {
 	const minScreenBits = PacketSize * 8
 	entries, err := os.ReadDir("/sys/class/hidraw")
 	if err != nil {
 		return "", fmt.Sprintf("cannot read /sys/class/hidraw: %v", err)
 	}
+	idTag := fmt.Sprintf("%04X:%04X", vid, pid)
 	best, bestBits := "", 0
-	var seen []string
+	var matched, others []string
 	for _, e := range entries {
-		dir := "/sys/class/hidraw/" + e.Name() + "/device/"
-		uevent, err := os.ReadFile(dir + "uevent")
+		dev := "/sys/class/hidraw/" + e.Name() + "/device"
+		target, _ := os.Readlink(dev) // e.g. ../../…/usb1/1-2/1-2:1.2/0003:04D9:FD01.0003
+		label := lastElem(target)
+		if label == "" {
+			label = "?"
+		}
+		uevent, err := os.ReadFile(dev + "/uevent")
 		if err != nil {
-			seen = append(seen, fmt.Sprintf("%s: uevent unreadable (%v)", e.Name(), err))
+			others = append(others, fmt.Sprintf("%s(%s, uevent: %v)", e.Name(), label, err))
 			continue
 		}
 		u, p, ok := matchProductUEvent(string(uevent))
-		if !ok || u != vid || p != pid {
+		if !ok && strings.Contains(target, idTag) {
+			u, p, ok = vid, pid, true
+		}
+		if !ok {
+			others = append(others, fmt.Sprintf("%s(%s)", e.Name(), label))
 			continue
 		}
-		rd, err := os.ReadFile(dir + "report_descriptor")
+		rd, err := os.ReadFile(dev + "/report_descriptor")
 		if err != nil {
-			seen = append(seen, fmt.Sprintf("%s: report_descriptor unreadable (%v)", e.Name(), err))
+			matched = append(matched, fmt.Sprintf("%s[%04x:%04x]: report_descriptor unreadable (%v)", e.Name(), u, p, err))
 			continue
 		}
 		bits := maxOutputReportBits(rd)
-		seen = append(seen, fmt.Sprintf("%s: %d-bit output report (%d-byte descriptor)", e.Name(), bits, len(rd)))
+		matched = append(matched, fmt.Sprintf("%s[%04x:%04x]: %d-bit output report (%d-byte descriptor)", e.Name(), u, p, bits, len(rd)))
 		if bits >= minScreenBits && bits > bestBits {
 			best, bestBits = "/dev/"+e.Name(), bits
 		}
 	}
-	return best, strings.Join(seen, "; ")
+	switch {
+	case best != "":
+		return best, strings.Join(matched, "; ")
+	case len(matched) > 0:
+		return "", strings.Join(matched, "; ")
+	case len(entries) == 0:
+		return "", "/sys/class/hidraw is empty — the host sysfs is not visible to this process"
+	default:
+		return "", fmt.Sprintf("none of %d hidraw node(s) carries %s: [%s]", len(entries), idTag, strings.Join(others, ", "))
+	}
 }
 
 // Shutdown releases the HID subsystem; call once after the last Display close.

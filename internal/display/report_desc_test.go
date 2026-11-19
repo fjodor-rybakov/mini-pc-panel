@@ -58,3 +58,15 @@ func TestMatchProductUEvent(t *testing.T) {
 		t.Errorf("parseHIDModalias: got vid=%04x pid=%04x ok=%v", vid, pid, ok)
 	}
 }
+
+func TestLastElem(t *testing.T) {
+	if got := lastElem("../../devices/pci0000:00/usb1/1-2/1-2:1.2/0003:04D9:FD01.0003"); got != "0003:04D9:FD01.0003" {
+		t.Errorf("lastElem sysfs link: got %q", got)
+	}
+	if got := lastElem("bare"); got != "bare" {
+		t.Errorf("lastElem bare: got %q", got)
+	}
+	if got := lastElem(""); got != "" {
+		t.Errorf("lastElem empty: got %q", got)
+	}
+}

@@ -80,6 +80,14 @@ func matchProductUEvent(uevent string) (vid, pid uint16, ok bool) {
 	return mVid, mPid, mOK
 }
 
+// lastElem returns the final '/'-separated component of a path ("" for "").
+func lastElem(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
 // parseHIDModalias parses "hid:b<bus>v<vid>p<pid>e<rev>" — every field is
 // exactly four hex digits, zero-padded by the kernel.
 func parseHIDModalias(v string) (vid, pid uint16, ok bool) {
