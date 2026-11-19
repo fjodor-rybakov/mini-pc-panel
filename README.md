@@ -60,9 +60,9 @@ docker compose up -d --build   # готовый вариант с devices/volume
 При первом запуске в том `/etc/s1panel` засевается `config.json` (из
 `config.example.json`) и каталог `themes/`. Контейнеру нужны устройства
 панели и подсветки: `--device /dev/hidraw0 --device /dev/ttyUSB0`
-(нужен узел **MI_01** — у панели два hidraw-узла, правильный тот, у чего
-`readlink -f /sys/class/hidraw/hidrawN/device` оканчивается на `:1.1`;
-при «плавающем» номере — udev-силинка, см. ниже). Хостовые
+(лучше передавать **все** hidraw-узлы панели — `grep -l 4d9
+/sys/class/hidraw/*/device/uevent`: экранный узел зависит от ревизии
+прошивки, демон выберет его сам, см. примечание в udev-разделе). Хостовые
 датчики видны как есть (`/sys/class/hwmon` в контейнере read-only), а
 `sensors.mount_points` меряет монтирования внутри контейнера — конфиг под
 контейнер обычно стоит поправить.
@@ -79,9 +79,6 @@ docker compose up -d --build   # готовый вариант с devices/volume
 
 ```
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", MODE="0660", GROUP="plugdev"
-# закрепить экран (MI_01) отдельным именем: номера hidrawN «плавают»,
-# а у панели два интерфейса (MI_00 клавиатура + MI_01 экран)
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fd01", ATTRS{bInterfaceNumber}=="01", SYMLINK+="s1panel-hidraw"
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666"
 ```
 
@@ -90,12 +87,17 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev $USER   # перелогиниться
 ```
 
-Если демон не находит интерфейс по номеру (`display: 04d9:fd01 enumerated
-but none of its interfaces is 1 [found: ...]` — hidapi не смог прочитать
-номера интерфейсов из sysfs, бывает в контейнерах), узел закрепляется прямо
-в конфиге: `"device": { "path": "/dev/s1panel-hidraw" }` (или `/dev/hidrawN`,
-у которого `readlink -f /sys/class/hidraw/hidrawN/device` оканчивается на
-`:1.1`). При заданном `path` `vid`/`pid`/`interface` не участвуют в поиске.
+Прошивки панелей различаются: у оригинальных экран сидит на HID-интерфейсе
+MI_01 (`:1.1` — так и было в оригинальном `config.json`: `"device":
+"1-8:1.1"`), у других ревизий hidraw-узлы панели — это `:1.0` и `:1.2`
+(узла MI_01 нет вовсе), а hidapi иногда не может прочитать номера
+интерфейсов вообще. Демон справляется сам: если заданного `interface` нет в
+перечислении, он выбирает из hidraw-узлов панели тот, у которого в
+report-дескрипторе output-отчёт на 4104 байта — такой только у экранного
+интерфейса (`internal/display/report_desc.go`). Вручную узел закрепляется
+прямо в конфиге: `"device": { "path": "/dev/hidrawN" }` (перебором узлов —
+экранный тот, от которого панель оживает); при заданном `path`
+`vid`/`pid`/`interface` в поиске не участвуют.
 
 ### systemd
 
