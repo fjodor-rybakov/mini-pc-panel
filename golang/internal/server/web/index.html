@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S1 Panel — редактор виджетов</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>S1 Panel — редактор виджетов</h1>
+  <span class="theme-ctl">
+    тема <select id="themePick"></select>
+    ориентация
+    <select id="orientation">
+      <option value="landscape">альбом 320×170</option>
+      <option value="portrait">книжная 170×320</option>
+    </select>
+    обновление
+    <select id="refresh">
+      <option value="update">частичное (update)</option>
+      <option value="redraw">полный кадр (redraw)</option>
+    </select>
+    фон <input type="color" id="themeBg">
+  </span>
+</header>
+
+<main>
+  <section id="left">
+    <div id="toolbar">
+      <label>масштаб <input type="range" id="zoom" min="1" max="6" step="1" value="2"></label>
+      <label><input type="checkbox" id="showGrid" checked> сетка</label>
+      <label><input type="checkbox" id="snap" checked> привязка к сетке</label>
+      <label>шаг
+        <select id="step">
+          <option>5</option>
+          <option selected>10</option>
+          <option>20</option>
+        </select>
+      </label>
+      <span id="coords" class="coords">—</span>
+    </div>
+
+    <div id="tabs"></div>
+
+    <div id="canvasWrap"><canvas id="cv"></canvas></div>
+
+    <div id="palette">
+      <span class="hint">добавить виджет:</span>
+      <button data-add="text">текст</button>
+      <button data-add="doughnut">кольцо</button>
+      <button data-add="doughnut_chart">кольцо+график</button>
+      <button data-add="line_chart">график</button>
+      <button data-add="bar_chart">столбцы/шкала</button>
+      <button data-add="custom_bar">шкала с градиентом</button>
+      <button data-add="spacer">пусто</button>
+      <button id="delWidget" class="danger">удалить выбранный</button>
+    </div>
+
+    <div id="screenCtl">
+      имя <input type="text" id="scName">
+      длительность, мс <input type="number" id="scDur" min="1000" step="500">
+      <label><input type="checkbox" id="scEnabled"> экран включён</label>
+      <button id="addScreen">+ экран</button>
+      <button id="delScreen" class="danger">− экран</button>
+    </div>
+  </section>
+
+  <aside id="props"><p class="hint">Кликните виджет на холсте, чтобы настроить свойства. Перетаскивание — мышью, уголки — изменение размера, стрелки — сдвиг по сетке.</p></aside>
+</main>
+
+<footer>
+  <button id="preview" class="primary">Примерить на экран</button>
+  <label><input type="checkbox" id="saveApply" checked> сохранить тему в файл</label>
+  <button id="apply" class="accent">Применить</button>
+  <button id="reload">Загрузить с панели</button>
+  <button id="nextScreen">Следующий экран</button>
+  <label><input type="checkbox" id="pauseRot"> пауза ротации</label>
+  <img id="previewImg" alt="как видит экран" title="PNG, отдаваемый панелью после «Примерить»">
+  <span class="led">
+    LED: режим
+    <select id="ledTheme">
+      <option value="1">радуга</option>
+      <option value="2">дыхание</option>
+      <option value="3">смена цвета</option>
+      <option value="4">выкл</option>
+      <option value="5">авто</option>
+    </select>
+    яркость <select id="ledInt"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+    скорость <select id="ledSpd"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+    <button id="ledApply">OK</button>
+  </span>
+  <span id="status"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

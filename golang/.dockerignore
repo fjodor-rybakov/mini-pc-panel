@@ -1,0 +1,5 @@
+bin/
+coverage.out
+panel-data/
+docker-compose.yml
+*.test

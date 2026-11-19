@@ -1,0 +1,40 @@
+{
+  "device": {
+    "vid": "0x04D9",
+    "pid": "0xFD01",
+    "interface": 1
+  },
+  "led": {
+    "port": "/dev/ttyUSB0",
+    "enabled": true,
+    "theme": 5,
+    "intensity": 3,
+    "speed": 3
+  },
+  "theme_file": "themes/demo.json",
+  "theme_list": [
+    { "name": "Демо", "config": "themes/demo.json" }
+  ],
+  "listen": "0.0.0.0:8686",
+  "debug_update": false,
+  "poll": 1000,
+  "heartbeat": 60000,
+  "redraw_delay": 1600,
+  "packet_delay": 10,
+  "fonts": {
+    "DejaVu Sans": {
+      "regular": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    }
+  },
+  "sensors": {
+    "network_interfaces": ["eth0", "wlan0"],
+    "mount_points": ["/"],
+    "hwmon_chips": ["coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz", "nvme"],
+    "hwmon_temp_labels": ["Package id 0", "Tctl", "Tdie", "Composite", "temp1_input"],
+    "hwmon_power_labels": ["Package power", "CPU power", "power1_input"],
+    "max_points": 300,
+    "fahrenheit": false,
+    "scaling": 1.5
+  }
+}
