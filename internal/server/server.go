@@ -35,6 +35,8 @@ type Panel interface {
 	Theme() *config.Theme
 	CurrentScreenIndex() int
 	Config() *config.Config
+	ThemeFile() string
+	SetThemeFile(path string)
 	SwapTheme(t *config.Theme)
 	PreviewFrame(t *config.Theme, screenIdx int) (*render.Frame, error)
 	PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx int) (*render.Frame, error)
@@ -47,9 +49,10 @@ type Panel interface {
 // Server bundles the editor routes; the panel reference gives access to the
 // live display, theme and telemetry.
 type Server struct {
-	app  Panel
-	addr string
-	mux  *http.ServeMux
+	app     Panel
+	addr    string
+	mux     *http.ServeMux
+	httpSrv *http.Server // set by ListenAndServe; Shutdown stops it gracefully
 }
 
 // New wires routes; the embedded web/ editor (vanilla JS, no build step)
@@ -76,12 +79,22 @@ func New(a Panel, addr string) *Server {
 
 // ListenAndServe runs the editor HTTP server (blocking).
 func (s *Server) ListenAndServe() error {
-	httpSrv := &http.Server{
+	s.httpSrv = &http.Server{
 		Addr:              s.addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	return httpSrv.ListenAndServe()
+	return s.httpSrv.ListenAndServe()
+}
+
+// Shutdown stops the editor server gracefully (in-flight handlers get to
+// finish, the listener closes). Safe to call even if ListenAndServe never
+// ran.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpSrv == nil {
+		return nil
+	}
+	return s.httpSrv.Shutdown(ctx)
 }
 
 // Handler exposes the routes (used by server_test.go via httptest).
@@ -144,7 +157,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"theme":          s.app.Theme(),
 		"current_screen": s.app.CurrentScreenIndex(),
 		"config": map[string]any{
-			"theme_file": s.app.Config().ThemeFile,
+			"theme_file": s.app.ThemeFile(),
 			"led":        s.app.Config().LED,
 		},
 	})
@@ -169,7 +182,7 @@ func (s *Server) handleThemes(w http.ResponseWriter, r *http.Request) {
 	cfg := s.app.Config()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"themes":     cfg.ThemeList,
-		"theme_file": cfg.ThemeFile,
+		"theme_file": s.app.ThemeFile(),
 	})
 }
 
@@ -218,7 +231,7 @@ func (s *Server) handleThemeSwitch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	cfg.ThemeFile = path
+	s.app.SetThemeFile(path)
 	s.app.SwapTheme(t)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": ref.Name, "file": path})
 }
@@ -233,6 +246,7 @@ func (s *Server) handleNextScreen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targetID := -1
+	explicit := false
 	if len(body) > 0 {
 		var req struct {
 			ID *int `json:"id"`
@@ -243,9 +257,12 @@ func (s *Server) handleNextScreen(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.ID != nil {
 			targetID = *req.ID
+			explicit = true
 		}
 	}
-	if targetID >= 0 {
+	if explicit {
+		// An explicit id — even a negative one — must answer 404, not
+		// silently fall through to plain "next screen".
 		if !s.app.ShowScreen(targetID) {
 			writeErr(w, http.StatusNotFound, fmt.Errorf("no enabled screen with id %d", targetID))
 			return
@@ -292,7 +309,12 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, err)
 		return
 	}
-	frame, err := s.app.PreviewOnScreen(r.Context(), t, idx)
+	// NOT r.Context(): a browser disconnect mid-request used to cancel the
+	// queued redraw halfway and leave a torn frame on the physical panel.
+	// The draft must finish landing (previewHold keeps it visible anyway).
+	pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	frame, err := s.app.PreviewOnScreen(pctx, t, idx)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
@@ -314,7 +336,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	s.app.SwapTheme(t)
 	saved := false
 	if r.URL.Query().Get("save") == "1" {
-		if err := config.SaveTheme(s.app.Config().ThemeFile, t); err != nil {
+		if err := config.SaveTheme(s.app.ThemeFile(), t); err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -332,6 +354,12 @@ func (s *Server) handleLED(w http.ResponseWriter, r *http.Request) {
 	var settings config.LEDSettings
 	if err := json.Unmarshal(body, &settings); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// Bad payloads are the client's fault (400); only port errors after a
+	// valid request are 502 — the editor shows validation problems inline.
+	if settings.Theme < 1 || settings.Theme > 6 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("led theme must be 1..6, got %d", settings.Theme))
 		return
 	}
 	if err := s.app.ApplyLEDManual(settings); err != nil {

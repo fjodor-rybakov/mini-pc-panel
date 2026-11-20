@@ -70,6 +70,23 @@ func TestFrameRegionAndSameRegion(t *testing.T) {
 	if !f.SameRegion(h, 1, 1, 2, 1) {
 		t.Fatal("change outside the region must NOT dirty it (poll optimisation)")
 	}
+	// Out-of-bounds rects must clip to the frame, not panic. The 4x2 frame
+	// clips (3,1)+4x1 to pixel 3 of row 1 = bytes 14..15.
+	if got := f.Region(3, 1, 4, 1); !bytes.Equal(got, []byte{14, 15}) {
+		t.Fatalf("clipped Region = %v, want [14 15]", got)
+	}
+	if got := f.Region(-1, -1, 4, 4); len(got) != 3*2*2 { // clip -> (0,0)+(3,2)
+		t.Fatalf("clipped whole-frame Region = %d bytes, want %d", len(got), 3*2*2)
+	}
+	if !f.SameRegion(f, -5, -5, 100, 100) {
+		t.Fatal("clipped whole-frame compare must hold")
+	}
+	if f.SameRegion(g, -1, -1, 10, 10) { // g differs at pixel 6, now inside
+		t.Fatal("clipped whole-frame compare must detect the change")
+	}
+	if len(f.Region(-10, -10, 5, 5)) != 0 { // clip -> empty, no panic
+		t.Fatal("rect missing the frame must yield an empty blob")
+	}
 }
 
 const landscapeDraft = `{"orientation":"landscape","screens":[{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":10,"y":10,"width":100,"height":20},"sensor":"cpu","format":"{0}"}]}]}`

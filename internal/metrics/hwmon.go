@@ -61,7 +61,12 @@ func (s *tempSensor) Sample() (Reading, error) {
 	}
 	if s.opts.Fahrenheit {
 		value = celsiusToFahrenheit(value)
-		sibMax = celsiusToFahrenheit(sibMax)
+		if sibMax > 0 {
+			// Only convert a REAL sibling max: an absent one (0) would
+			// become 32.0 °F, then satisfy the "sibMax > 0" case below and
+			// set Max=32 < Min=70 - the 230 °F default was unreachable.
+			sibMax = celsiusToFahrenheit(sibMax)
+		}
 	}
 	if !s.init {
 		switch {
@@ -104,11 +109,14 @@ func celsiusToFahrenheit(c float64) float64 { return c*9/5 + 32 }
 // ---- cpu_power (s1panel/sensors/cpu_power.js) ----
 
 // CPUPower returns a Sensor named "cpu_power": CPU package power draw in
-// watts, primary source /sys/class/powercap/*/energy_uj (RAPL) exactly
-// like the original (summed deltas per sample, including its divide-by-
-// elapsed-seconds only when the sample gap exceeds 1 s). When no RAPL
-// zone is readable the Go port additionally falls back to hwmon
-// power*_input (µW) — an extension; the original reported 0 W then.
+// watts, primary source /sys/class/powercap/*/energy_uj (RAPL). Unlike the
+// original it pairs zones by path (a zone disappearing no longer shifts a
+// positional pairing), reads only top-level zones (intel-rapl:N) so
+// sub-zones (intel-rapl:N:M) are not double counted, clamps energy_uj
+// wrap-arounds via max_energy_range_uj, and always divides the energy
+// delta by the real sample gap (behaviour change, see README "Отличия").
+// When no RAPL zone is readable the Go port additionally falls back to
+// hwmon power*_input (µW) — an extension; the original reported 0 W then.
 // Format tokens: {0} last watts, {1} history joined (max 28 like the
 // original default doughnut scale).
 func CPUPower(raplRoot, hwmonRoot string, chips, labels []string, maxPoints int) Sensor {
@@ -122,7 +130,7 @@ type powerSensor struct {
 	raplRoot, hwmonRoot string
 	chips, labels       []string
 	hist                *ring
-	prev                []float64
+	prev                map[string]float64 // last energy_uj per zone file
 	prevTime            time.Time
 }
 
@@ -131,27 +139,44 @@ func (powerSensor) Name() string { return "cpu_power" }
 func (s *powerSensor) Sample() (Reading, error) {
 	now := time.Now()
 	zones, _ := filepath.Glob(filepath.Join(s.raplRoot, "*", "energy_uj"))
+	zones = onlyTopLevelZones(zones)
 	watts := 0.0
 	if len(zones) > 0 {
-		cur := make([]float64, 0, len(zones))
+		cur := make(map[string]float64, len(zones))
 		for _, z := range zones {
 			if n, err := strconv.ParseFloat(readTrim(z), 64); err == nil {
-				cur = append(cur, n)
+				cur[z] = n
 			}
 		}
-		// Original: no division on the very first sample (_previous null ->
-		// watts 0, still pushed), energy_uj wrap-arounds are NOT clamped.
-		if s.prev != nil {
-			n := min(len(cur), len(s.prev))
-			for i := 0; i < n; i++ {
-				watts += (cur[i] - s.prev[i]) / 1_000_000
+		// Pair zones by path: the original paired them positionally, so a
+		// zone disappearing mid-run silently subtracted one zone's energy
+		// from another's previous value.
+		for path, v := range cur {
+			prev, ok := s.prev[path]
+			if !ok {
+				continue
 			}
+			delta := v - prev
+			if delta < 0 {
+				// energy_uj is a free-running counter that wraps at
+				// max_energy_range_uj; the original counted the wrap as a
+				// huge negative spike. Clamp it back into range; an
+				// unparseable range means we cannot trust the sample.
+				maxPath := filepath.Join(filepath.Dir(path), "max_energy_range_uj")
+				if mr, err := strconv.ParseFloat(readTrim(maxPath), 64); err == nil && mr > 0 && prev <= mr {
+					delta = v + mr - prev
+				} else {
+					delta = 0
+				}
+			}
+			watts += delta / 1_000_000
 		}
+		// Original quirk (cpu_power.js line 142-153): the per-sample energy
+		// was divided by the elapsed seconds only when that gap exceeded 1 s,
+		// so sub-second ticks reported raw microjoules as watts. Always
+		// divide by the real gap now (behaviour change, see README).
 		if !s.prevTime.IsZero() {
-			// Original quirk (cpu_power.js line 142-153): the per-sample
-			// energy is divided by the elapsed seconds only when that gap
-			// exceeds 1 s.
-			if dt := now.Sub(s.prevTime).Seconds(); dt > 1 {
+			if dt := now.Sub(s.prevTime).Seconds(); dt > 0 {
 				watts /= dt
 			}
 		}
@@ -172,6 +197,24 @@ func (s *powerSensor) Sample() (Reading, error) {
 		Series:  map[int]Series{1: {Values: vals, Max: 28}},
 		When:    now,
 	}, nil
+}
+
+// onlyTopLevelZones keeps RAPL top-level zones (intel-rapl:N) and drops
+// sub-zones (intel-rapl:N:M): the kernel reports sub-zone energy as part
+// of its parent, so summing both double counts (package + core/dimm).
+// If nothing looks top-level (unusual naming), keep everything rather
+// than report 0 W.
+func onlyTopLevelZones(zones []string) []string {
+	var top []string
+	for _, z := range zones {
+		if strings.Count(filepath.Base(filepath.Dir(z)), ":") <= 1 {
+			top = append(top, z)
+		}
+	}
+	if len(top) == 0 {
+		return zones
+	}
+	return top
 }
 
 // ---- shared hwmon discovery ----
@@ -230,14 +273,33 @@ func findHwmon(root string, chips, labels []string, base string) (hwmonHit, erro
 		}
 	}
 	if best.input == "" {
-		for _, dir := range dirs { // plain <base>1_input fallback
-			if !chipWanted(chips, readTrim(filepath.Join(dir, "name"))) {
-				continue
+		// Plain <base>1_input fallback. Walk the chip list in priority
+		// order, not hwmonN directory order: with the default chips
+		// (coretemp...nvme), a lexicographic dir scan could hand nvme's
+		// power1_input to cpu_power. Without an explicit chip list, keep
+		// the dir-order scan.
+		for _, chip := range chips {
+			for _, dir := range dirs {
+				if !strings.EqualFold(readTrim(filepath.Join(dir, "name")), chip) {
+					continue
+				}
+				cand := filepath.Join(dir, base+"1_input")
+				if _, err := os.Stat(cand); err == nil {
+					best.input = cand
+					break
+				}
 			}
-			cand := filepath.Join(dir, base+"1_input")
-			if _, err := os.Stat(cand); err == nil {
-				best.input = cand
+			if best.input != "" {
 				break
+			}
+		}
+		if best.input == "" && len(chips) == 0 {
+			for _, dir := range dirs {
+				cand := filepath.Join(dir, base+"1_input")
+				if _, err := os.Stat(cand); err == nil {
+					best.input = cand
+					break
+				}
 			}
 		}
 	}

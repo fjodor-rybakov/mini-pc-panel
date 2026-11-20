@@ -142,7 +142,9 @@ function drawWidget(w, z, bg) {
   ctx.strokeRect(x + 0.5, y + 0.5, ww, hh);
   ctx.setLineDash([]);
 
-  if (w.fill && (w.type === "text" || w.type === "bar_chart")) {
+  // fill is the bar fill colour on the device (Go drawBarChart), so it
+  // must not flood the bar_chart preview; only text gets a rect backdrop.
+  if (w.fill && w.type === "text") {
     ctx.fillStyle = w.fill;
     ctx.fillRect(x, y, ww, hh);
   }
@@ -178,7 +180,7 @@ function drawWidget(w, z, bg) {
       drawSpark(w, x, y, ww, hh);
       break;
     case "bar_chart": {
-      const col = w.color || w.fill || "#00ff00";
+      const col = w.fill || w.color || "#00ff00";
       if (!w.points || w.points <= 1) {
         ctx.fillStyle = col;
         ctx.fillRect(x, y, ww * frac(w), hh);
@@ -239,7 +241,7 @@ function drawSpark(w, x, y, ww, hh) {
   const dx = ww / (pts.length - 1);
   const py = (v) => y + hh - Math.min(1, v / hi) * hh;
   if (w.area) {
-    ctx.fillStyle = w.color || "#00ff00";
+    ctx.fillStyle = w.fill || w.color || "#00ff00";
     ctx.beginPath();
     ctx.moveTo(x, y + hh);
     pts.forEach((v, i) => ctx.lineTo(x + i * dx, py(v)));
@@ -247,7 +249,7 @@ function drawSpark(w, x, y, ww, hh) {
     ctx.closePath();
     ctx.fill();
   }
-  ctx.strokeStyle = w.color || "#00ff00";
+  ctx.strokeStyle = w.outline || w.color || "#00ff00";
   ctx.lineWidth = Math.max(1, (w.thickness || 1));
   ctx.beginPath();
   pts.forEach((v, i) => (i ? ctx.lineTo(x + i * dx, py(v)) : ctx.moveTo(x, py(v))));

@@ -30,19 +30,23 @@ type App struct {
 	disp     *display.Display
 	led      *led.Device // nil when disabled or the port is missing
 
-	mu            sync.Mutex
-	theme         *config.Theme
-	themeDirty    bool
-	screenIdx     int
-	screenSince   time.Time
-	screenPaused  bool // original /api/pause?on=
-	forceRedraw   bool
-	lastFrame     *render.Frame
-	readings      map[string]metrics.Reading
-	previewUntil  time.Time
-	lastHeartbeat time.Time
-	manualLED     *config.LEDSettings // editor-driven LED set (outranks config)
-	lastLEDTheme  int                 // mode the strip now holds (0 = nothing sent)
+	mu           sync.Mutex
+	theme        *config.Theme
+	themeDirty   bool
+	screenIdx    int
+	screenSince  time.Time
+	screenPaused bool // original /api/pause?on=
+	forceRedraw  bool
+	// lastWriteFails remembers display.WriteFailures() as of the previous
+	// tick; only the Run/tick goroutine touches it, so it needs no lock.
+	lastWriteFails uint64
+	lastFrame      *render.Frame
+	readings       map[string]metrics.Reading
+	previewUntil   time.Time
+	previewLED     bool // preview pushed the draft screen's LED; restore after it expires
+	lastHeartbeat  time.Time
+	manualLED      *config.LEDSettings // editor-driven LED set (outranks config)
+	lastLEDTheme   int                 // mode the strip now holds (0 = nothing sent)
 }
 
 // New opens the hardware and loads the theme; it does not start traffic yet.
@@ -207,9 +211,22 @@ func (a *App) markHeartbeatSent() {
 
 // tick rotates screens, samples metrics and sends only what changed.
 func (a *App) tick(ctx context.Context) error {
+	// display.process drops the rest of a job when a Write fails, so the
+	// panel no longer matches lastFrame (our diff baseline). Any change in
+	// the failure counter means "assume the worst": latch a full redraw.
+	if fails := a.disp.WriteFailures(); fails != a.lastWriteFails {
+		a.lastWriteFails = fails
+		a.mu.Lock()
+		a.forceRedraw = true
+		a.mu.Unlock()
+	}
 	a.mu.Lock()
 	previewing := time.Now().Before(a.previewUntil)
 	dirty := a.themeDirty
+	expiredPreview := !previewing && a.previewLED
+	if expiredPreview {
+		a.previewLED = false
+	}
 	a.mu.Unlock()
 
 	if dirty {
@@ -223,11 +240,17 @@ func (a *App) tick(ctx context.Context) error {
 		a.applyScreenLED(a.currentScreen())
 	}
 
-	a.rotateScreen()
 	a.refresh()
 	if previewing {
 		return nil // editor preview still on screen; metrics kept sampling
 	}
+	// Rotation must NOT run while the draft holds the screen (it used to
+	// advance screens and push that screen's LED mid-preview). Once the
+	// preview expires, put the strip back to the live screen's settings.
+	if expiredPreview {
+		a.applyScreenLED(a.currentScreen())
+	}
+	a.rotateScreen()
 
 	frame, err := a.renderCurrent()
 	if err != nil {
@@ -255,7 +278,7 @@ func (a *App) tick(ctx context.Context) error {
 	sc := a.currentScreen()
 	_, _, portrait := a.Theme().OrientationSize()
 	for _, w := range sc.Widgets {
-		dr := DeviceRect(w.Rect, portrait)
+		dr := clampToFrame(DeviceRect(w.Rect, portrait), frame.Width, frame.Height)
 		if dr.Width <= 0 || dr.Height <= 0 {
 			continue
 		}
@@ -264,6 +287,12 @@ func (a *App) tick(ctx context.Context) error {
 		}
 		for _, sub := range display.SplitRect(display.Rect{X: dr.X, Y: dr.Y, Width: dr.Width, Height: dr.Height}) {
 			if err := a.disp.Update(ctx, sub, frame.Region(sub.X, sub.Y, sub.Width, sub.Height)); err != nil {
+				// Earlier sub-rects may already be on the panel: the screen
+				// is now a mix of old and new frames. Don't adopt this frame
+				// as the baseline - resync with a full redraw next tick.
+				a.mu.Lock()
+				a.forceRedraw = true
+				a.mu.Unlock()
 				return err
 			}
 		}
@@ -284,6 +313,11 @@ func (a *App) rotateScreen() {
 	screens := a.theme.Screens
 	if len(screens) < 2 {
 		return
+	}
+	if a.screenIdx < 0 || a.screenIdx >= len(screens) {
+		// A hot theme swap can land between this tick's dirty check and
+		// here: the stale index may be out of range for the new theme.
+		a.screenIdx = a.firstEnabledIndex()
 	}
 	dur := screens[a.screenIdx].Duration
 	if dur == 0 {
@@ -373,7 +407,7 @@ func (a *App) firstEnabledIndex() int {
 func (a *App) currentScreen() *config.Screen {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.screenIdx >= len(a.theme.Screens) {
+	if a.screenIdx < 0 || a.screenIdx >= len(a.theme.Screens) {
 		a.screenIdx = 0
 	}
 	return &a.theme.Screens[a.screenIdx]
@@ -381,6 +415,9 @@ func (a *App) currentScreen() *config.Screen {
 
 func (a *App) renderCurrent() (*render.Frame, error) {
 	a.mu.Lock()
+	if a.screenIdx < 0 || a.screenIdx >= len(a.theme.Screens) {
+		a.screenIdx = 0 // same clamp as currentScreen: a swap can beat the tick
+	}
 	sc := &a.theme.Screens[a.screenIdx]
 	theme := a.theme
 	a.mu.Unlock()
@@ -479,6 +516,11 @@ func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 	if settings.Theme < led.ThemeRainbow || settings.Theme > led.ThemeIgnore {
 		return fmt.Errorf("app: led: theme must be 1..6, got %d", settings.Theme)
 	}
+	// Port writes run under a.mu as well: the rotation path
+	// (applyScreenLEDLocked) drives the same CH340 from the loop
+	// goroutine, and interleaved FA..checksum frames latch garbage.
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	switch settings.Theme {
 	case led.ThemeIgnore:
 		log.Printf("app: led theme 6 (ignore): no packet sent")
@@ -491,8 +533,6 @@ func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 			return err
 		}
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if settings.Theme != led.ThemeIgnore {
 		a.lastLEDTheme = settings.Theme
 	}
@@ -508,8 +548,8 @@ func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 // ("ignore"), nothing is sent.
 func (a *App) shutdownLED() {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	last := a.lastLEDTheme
-	a.mu.Unlock()
 	if a.led == nil || last == 0 || last == led.ThemeIgnore {
 		return
 	}
@@ -535,6 +575,33 @@ func DeviceRect(r config.Rect, portrait bool) config.Rect {
 	}
 }
 
+// clampToFrame intersects a device-space rect with the panel frame, so the
+// wire rect display.Update receives always matches the Frame.Region blob
+// byte count even for rects that stick out of the screen.
+func clampToFrame(r config.Rect, fw, fh int) config.Rect {
+	if r.X < 0 {
+		r.Width += r.X
+		r.X = 0
+	}
+	if r.Y < 0 {
+		r.Height += r.Y
+		r.Y = 0
+	}
+	if x1 := r.X + r.Width; x1 > fw {
+		r.Width -= x1 - fw
+	}
+	if y1 := r.Y + r.Height; y1 > fh {
+		r.Height -= y1 - fh
+	}
+	if r.Width < 0 {
+		r.Width = 0
+	}
+	if r.Height < 0 {
+		r.Height = 0
+	}
+	return r
+}
+
 // Theme returns the live theme (do not mutate).
 func (a *App) Theme() *config.Theme {
 	a.mu.Lock()
@@ -548,6 +615,10 @@ func (a *App) SwapTheme(t *config.Theme) {
 	a.mu.Lock()
 	a.theme = t
 	a.themeDirty = true
+	// The old screenIdx can be out of range for the new theme (shorter
+	// screens list): every indexer must never see the stale value.
+	a.screenIdx = 0
+	a.screenSince = time.Now()
 	a.mu.Unlock()
 	a.warnUnknownSensors(t)
 }
@@ -571,8 +642,38 @@ func (a *App) warnUnknownSensors(t *config.Theme) {
 	}
 }
 
-// Config returns the daemon configuration (read-only use by the server).
+// Config returns the daemon configuration. Everything but theme_file is
+// fixed at load time and safe to read through this pointer; the live
+// theme_file is guarded by ThemeFile/SetThemeFile (the editor's
+// /api/theme used to write cfg.ThemeFile unlocked while the poll loop
+// read it).
 func (a *App) Config() *config.Config { return a.cfg }
+
+// ThemeFile is the live theme file path (locked).
+func (a *App) ThemeFile() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.ThemeFile
+}
+
+// SetThemeFile updates the live theme file path (locked, in memory only —
+// config.json on disk is never rewritten).
+func (a *App) SetThemeFile(path string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg.ThemeFile = path
+}
+
+// ManualLED reports the LED settings last pushed from the editor, if any
+// (they act as the live global until restart, outranking config.json).
+func (a *App) ManualLED() (config.LEDSettings, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.manualLED == nil {
+		return config.LEDSettings{}, false
+	}
+	return *a.manualLED, true
+}
 
 // CurrentScreenIndex is the screen currently shown (editor highlight).
 func (a *App) CurrentScreenIndex() int {
@@ -617,6 +718,7 @@ func (a *App) PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx in
 	a.mu.Lock()
 	a.previewUntil = time.Now().Add(previewHold)
 	a.forceRedraw = true
+	a.previewLED = a.led != nil // tick restores the live screen's LED on expiry
 	a.mu.Unlock()
 	a.applyScreenLED(&t.Screens[screenIdx])
 	return frame, nil

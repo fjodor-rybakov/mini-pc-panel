@@ -2,6 +2,7 @@ package display
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -151,10 +152,53 @@ func TestDisplayInputValidation(t *testing.T) {
 	if n := tr.count(); n != 0 {
 		t.Fatalf("rejected commands still wrote %d packets", n)
 	}
+	// Frame bounds: coords go on the wire as uint16 LE, so a negative
+	// origin would hit the panel as 65535 and an oversized rect desyncs
+	// it from the caller's diff baseline.
+	if err := d.Update(ctx, Rect{X: 310, Y: 0, Width: 20, Height: 10}, make([]byte, 400)); err == nil {
+		t.Fatal("rect past the right frame edge must be rejected")
+	}
+	if err := d.Update(ctx, Rect{X: 10, Y: 165, Width: 10, Height: 10}, make([]byte, 200)); err == nil {
+		t.Fatal("rect past the bottom frame edge must be rejected")
+	}
+	if err := d.Update(ctx, Rect{X: -5, Y: 0, Width: 10, Height: 10}, make([]byte, 200)); err == nil {
+		t.Fatal("negative origin must be rejected, not sent as 65535")
+	}
 	if err := d.Update(ctx, Rect{X: 10, Y: 10, Width: 10, Height: 10}, make([]byte, 200)); err != nil {
 		t.Fatalf("valid update rejected: %v", err)
 	}
 	waitForWrites(t, tr, 1)
+	d.Close()
+}
+
+// End-to-end for demo.json's custom_bar (300x6 at y=162): every piece
+// SplitRect produces must pass Update's validation and reach the wire in
+// order — the bug was Update rejecting the unsplit 300-wide rect, so the
+// bar never refreshed partially.
+func TestWideBarPiecesReachWire(t *testing.T) {
+	tr := newFakeTransport()
+	d := New(tr, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	r := Rect{X: 10, Y: 162, Width: 300, Height: 6}
+	subs := SplitRect(r)
+	for _, s := range subs {
+		if err := d.Update(ctx, s, make([]byte, s.Width*s.Height*2)); err != nil {
+			t.Fatalf("piece %dx%d rejected: %v", s.Width, s.Height, err)
+		}
+	}
+	waitForWrites(t, tr, len(subs))
+	for i, s := range subs {
+		p := tr.at(i)
+		if p[1] != CmdUpdate {
+			t.Fatalf("write %d cmd %02X, want update", i, p[1])
+		}
+		if x := int(binary.LittleEndian.Uint16(p[2:4])); x != s.X {
+			t.Fatalf("write %d x=%d, want %d (pieces out of order)", i, x, s.X)
+		}
+	}
 	d.Close()
 }
 
@@ -171,6 +215,12 @@ func TestWriteFailureDoesNotKillWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond) // worker processed (and logged) the failure
+
+	// The abandoned job diverged the panel from the caller's baseline; the
+	// poll loop watches this counter to latch a resync full redraw.
+	if n := d.WriteFailures(); n != 1 {
+		t.Fatalf("WriteFailures() = %d after one abandoned job, want 1", n)
+	}
 
 	tr.mu.Lock()
 	tr.failFrom = -1
@@ -192,5 +242,13 @@ func TestPostAfterCloseFails(t *testing.T) {
 	}
 	if err := d.Heartbeat(ctx, time.Now()); err == nil {
 		t.Fatal("posting after Close must fail")
+	}
+	// Double Close (Run's defer + main's explicit call, say): the HID
+	// descriptor close must run exactly once.
+	if err := d.Close(); err != nil {
+		t.Fatalf("second Close must be a no-op, got %v", err)
+	}
+	if tr.closed != 1 {
+		t.Fatalf("transport closed %d times, want 1", tr.closed)
 	}
 }

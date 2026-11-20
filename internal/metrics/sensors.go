@@ -303,18 +303,26 @@ type spaceSensor struct {
 }
 
 // Space returns a Sensor named "space_<name>" for one mount point, where
-// <name> is the mount point itself ("root" for "/") like the original
-// (which also allowed an explicit config.name override; the Go config
-// lists mount_points directly).
+// <name> is the sanitised mount point ("root" for "/"): the original kept
+// the raw path, so "/home" produced the name "space_/home" — a slash in
+// a flat lookup key that theme widgets and the editor reference by exact
+// string. Slashes and backslashes become "_", leading/trailing ones are
+// dropped: "/home" -> "space_home", "/mnt/data" -> "space_mnt_data".
 // Format tokens: {0} mount point, {1} free % joined, {2} used % joined,
 // {3} last free %, {4} last used %, {5} free MiB, {6} used MiB,
 // {7} total MiB, {8} "MiB". MB units are bytes/1048576, precision 0.
 func Space(mount string, maxPoints int) Sensor {
-	name := mount
-	if mount == "/" {
-		name = "root"
+	return &spaceSensor{mount: mount, name: "space_" + spaceName(mount), freeR: prefilledRing(maxPoints), usedR: prefilledRing(maxPoints)}
+}
+
+// spaceName sanitises a mount point into the "space_<name>" suffix.
+func spaceName(mount string) string {
+	p := strings.NewReplacer("/", "_", `\`, "_").Replace(mount)
+	p = strings.Trim(p, "_")
+	if p == "" {
+		return "root"
 	}
-	return &spaceSensor{mount: mount, name: "space_" + name, freeR: prefilledRing(maxPoints), usedR: prefilledRing(maxPoints)}
+	return p
 }
 
 func (s *spaceSensor) Name() string { return s.name }
@@ -418,6 +426,10 @@ func (s *networkSensor) Sample() (Reading, error) {
 		}
 	}
 	if !found {
+		// Drop the baseline: if the interface reappears its counters may
+		// have restarted, and subtracting the stale "last" would produce
+		// a bogus (or zero-suppressed) delta.
+		s.haveLast = false
 		return Reading{}, fmt.Errorf("network: interface %s not present", s.iface)
 	}
 	// Original: first sample yields 0 deltas (`_last ? cur - _last : 0`).

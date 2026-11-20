@@ -22,6 +22,13 @@ func TestHexUint16(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"vid":"0xZZZZ"}`), &c); err == nil {
 		t.Fatal("malformed hex must be rejected")
 	}
+	// 70000 used to truncate silently to 4464 — a typo would send the
+	// daemon hunting for a random device instead of failing at load.
+	for _, bad := range []string{`{"vid":70000}`, `{"vid":-1}`, `{"vid":1.5}`} {
+		if err := json.Unmarshal([]byte(bad), &c); err == nil {
+			t.Fatalf("%s must be rejected, not truncated", bad)
+		}
+	}
 }
 
 const minimalDraft = `{"screens":[{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":0,"y":0,"width":10,"height":10}}]}]}`
@@ -89,6 +96,69 @@ func TestLoadErrors(t *testing.T) {
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "theme_file") {
 		t.Fatalf("theme_file required; got %v", err)
+	}
+}
+
+// "../" in a relative theme path used to be joined blindly, letting a
+// config pull theme files (and editor writes) outside the config dir.
+func TestLoadRejectsPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(path, []byte(`{"theme_file":"../evil.json"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("theme_file escape must be rejected; got %v", err)
+	}
+	// original theme_list spelling: the path lives under the "config" key
+	if err := os.WriteFile(path, []byte(`{"theme_file":"ok.json","theme_list":[{"config":"../../etc/x.json"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("theme_list escape must be rejected; got %v", err)
+	}
+	// A nested but contained path stays fine.
+	if err := os.WriteFile(path, []byte(`{"theme_file":"themes/./demo.json"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("contained path rejected: %v", err)
+	}
+}
+
+// fix_value() clamps LED knobs silently, so out-of-range config values ran
+// a different effect than the user wrote instead of failing at load.
+func TestLoadRejectsBadLEDValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	for _, bad := range []string{
+		`{"theme_file":"t.json","led":{"theme":9}}`,
+		`{"theme_file":"t.json","led":{"speed":-2}}`,
+		`{"theme_file":"t.json","led":{"intensity":7}}`,
+	} {
+		if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("%s accepted; out-of-range led values must fail load", bad)
+		}
+	}
+}
+
+// Duplicate screen/widget ids made /api/next_screen?id=N and the editor
+// ambiguous; the original addressed screens BY id.
+func TestValidateDuplicateIDs(t *testing.T) {
+	dup := `{"screens":[
+		{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":0,"y":0,"width":10,"height":10}}]},
+		{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":0,"y":0,"width":10,"height":10}}]}]}`
+	if _, err := ParseTheme([]byte(dup)); err == nil || !strings.Contains(err.Error(), "duplicate screen id") {
+		t.Fatalf("duplicate screen ids: %v", err)
+	}
+	dupW := `{"screens":[{"id":1,"widgets":[
+		{"id":2,"type":"text","rect":{"x":0,"y":0,"width":10,"height":10}},
+		{"id":2,"type":"text","rect":{"x":20,"y":0,"width":10,"height":10}}]}]}`
+	if _, err := ParseTheme([]byte(dupW)); err == nil || !strings.Contains(err.Error(), "duplicate widget id") {
+		t.Fatalf("duplicate widget ids: %v", err)
 	}
 }
 

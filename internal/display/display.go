@@ -39,6 +39,11 @@ type Display struct {
 
 	mu      sync.Mutex
 	lastJob time.Time // when the most recent job was queued (heartbeat rule)
+	// writeFails counts jobs abandoned mid-write by process(): the panel
+	// then no longer matches the caller's diff baseline, and the poll loop
+	// consults this to latch a resync full redraw.
+	writeFails uint64
+	closed     bool // Close ran (tr.Close must not run twice)
 }
 
 // New wraps a Transport. delay is the inter-packet pause (spec: 10 ms);
@@ -83,6 +88,8 @@ func (d *Display) worker(ctx context.Context) {
 				case <-time.After(d.redrawDelay):
 				case <-d.quit:
 					return
+				case <-ctx.Done():
+					return // shutdown must not wait out redrawDelay
 				}
 			}
 		}
@@ -93,12 +100,28 @@ func (d *Display) worker(ctx context.Context) {
 func (d *Display) process(j *job) {
 	for _, p := range j.packets {
 		if err := d.tr.Write(p); err != nil {
-			// The original lcd_thread.js logged and carried on; do the same.
+			// The original lcd_thread.js logged and carried on. We log the
+			// same way but also count it: the rest of the job is dropped,
+			// so the panel's framebuffer no longer matches what the caller
+			// believes is on screen (its diff baseline). The poll loop
+			// watches WriteFailures and forces a full redraw after a gap.
 			log.Printf("display: %s: write error: %v", j.label, err)
+			d.mu.Lock()
+			d.writeFails++
+			d.mu.Unlock()
 			return
 		}
 		time.Sleep(d.delay) // spec §5.1: pause between packets
 	}
+}
+
+// WriteFailures is the number of jobs abandoned mid-write since startup.
+// A change since the previous poll means the panel diverged from the
+// caller's last-frame baseline and needs a full redraw to resync.
+func (d *Display) WriteFailures() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.writeFails
 }
 
 func (d *Display) post(ctx context.Context, j *job) error {
@@ -171,6 +194,12 @@ func (d *Display) Update(ctx context.Context, r Rect, pixels []byte) error {
 	if r.Width <= 0 || r.Height <= 0 || r.Width > 255 || r.Height > 255 {
 		return fmt.Errorf("display: update rect %dx%d out of uint8 range", r.Width, r.Height)
 	}
+	// Coordinates go on the wire as uint16 LE: a negative origin would
+	// become 65535 and a rect spilling past the frame desyncs the panel.
+	if r.X < 0 || r.Y < 0 || r.X+r.Width > FrameWidth || r.Y+r.Height > FrameHeight {
+		return fmt.Errorf("display: update rect (%d,%d) %dx%d outside %dx%d frame",
+			r.X, r.Y, r.Width, r.Height, FrameWidth, FrameHeight)
+	}
 	if r.Width*r.Height > MaxUpdatePixels {
 		return fmt.Errorf("display: update region %dx%d exceeds %d pixels per packet", r.Width, r.Height, MaxUpdatePixels)
 	}
@@ -182,13 +211,17 @@ func (d *Display) Update(ctx context.Context, r Rect, pixels []byte) error {
 }
 
 // Close stops the worker and closes the underlying transport, releasing the
-// USB descriptors (spec §5.3).
+// USB descriptors (spec §5.3). Idempotent: the HID descriptor close must run
+// exactly once - a second tr.Close on a dead handle is undefined behaviour.
 func (d *Display) Close() error {
-	select {
-	case <-d.quit:
-	default:
-		close(d.quit)
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil
 	}
+	d.closed = true
+	d.mu.Unlock()
+	close(d.quit)
 	d.wg.Wait()
 	return d.tr.Close()
 }

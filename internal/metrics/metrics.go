@@ -91,14 +91,29 @@ func (r *Registry) Names() []string {
 // corresponding widgets render "N/A". Every sensor is sampled every tick,
 // which also covers the original poll_inactive_screen_sensors behaviour.
 func (r *Registry) SampleAll() map[string]Reading {
-	out := make(map[string]Reading, len(r.names))
-	for _, name := range r.Names() {
-		reading, err := r.sensors[name].Sample()
+	// Snapshot names and sensors under ONE lock: reading r.sensors after
+	// Names() released the lock races a concurrent Register (a map read
+	// during a map write is a fatal concurrent-map access, not just a
+	// torn pointer). Sampling itself runs outside the lock.
+	r.mu.Lock()
+	sensors := make([]Sensor, 0, len(r.names))
+	names := make([]string, 0, len(r.names))
+	for _, name := range r.names {
+		if s, ok := r.sensors[name]; ok {
+			names = append(names, name)
+			sensors = append(sensors, s)
+		}
+	}
+	r.mu.Unlock()
+
+	out := make(map[string]Reading, len(sensors))
+	for i, s := range sensors {
+		reading, err := s.Sample()
 		if err != nil {
-			r.logOnce(name, err)
+			r.logOnce(names[i], err)
 			continue
 		}
-		out[name] = reading
+		out[names[i]] = reading
 	}
 	return out
 }

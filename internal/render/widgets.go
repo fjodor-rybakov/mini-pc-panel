@@ -198,6 +198,11 @@ func chartBounds(w config.Widget, s metrics.Reading, pts []float64) (float64, fl
 // the same ring renderer with a full circle and Thickness as ring width.
 // Chart.js rendered the ring over transparency, so the hole is a real hole
 // (wallpaper/below widgets stay visible), not a background-coloured disc.
+// doughnut_chart splits the rect ring-left/spark-right like the web editor
+// preview (drawRing + drawSpark): the ring squares off at min(ww,hh)
+// anchored to the left edge and the sensor history renders as a line
+// chart to its right when at least 8 px of clearance remains. The plain
+// legacy "doughnut" type keeps the centred full-rect ring and no spark.
 func drawDoughnutChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, rd map[string]metrics.Reading, bg string, plain bool) {
 	s := rd[w.Sensor]
 	lo, hi := chartBounds(w, s, nil)
@@ -239,8 +244,12 @@ func drawDoughnutChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widge
 			cut = 80 // doughnut_chart.js cutout '80%' default
 		}
 	}
+	d := min(ww, hh)
 	cx, cy := x+ww/2, y+hh/2
-	rOut := min(ww, hh) / 2
+	if !plain {
+		cx = x + d/2 // ring anchored left; the sparkline gets the remainder
+	}
+	rOut := d / 2
 	if plain {
 		// legacy Go ring: Thickness is the ring width in pixels
 		thick := float64(w.Thickness)
@@ -259,6 +268,11 @@ func drawDoughnutChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widge
 	annularSector(ctx, cx, cy, rOut, rIn, a0, a0+circ, free)
 	if frac > 0 {
 		annularSector(ctx, cx, cy, rOut, rIn, a0, a0+circ*frac, used)
+	}
+	// History sparkline right of the ring, like drawSpark in the editor
+	// preview: 4 px gap, 8 px minimum clearance (z = 1 on the device).
+	if !plain && ww > d+8 {
+		drawLineChart(ctx, x+d+4, y, ww-d-4, hh, w, rd)
 	}
 }
 
@@ -304,11 +318,13 @@ func annularSector(ctx *canvas.Context, cx, cy, rOut, rIn, a0, a1 float64, col s
 // ---- line chart ----
 
 // drawLineChart mirrors line_chart.js (Chart.js line chart): the stroke is
-// config.outline (#4d4d4d default) and the fill area - only when
-// config.area is true - is config.fill (#00e600 default), NOT the widget
-// text colour; borderWidth is config.thickness (Chart.js default 3). The
-// 0.1 tension is approximated with straight segments (documented
-// deviation).
+// config.outline falling back to config.color (the web editor's line
+// colour control writes w.color), then #4d4d4d (line_chart.js borderColor
+// default); the fill area - only when config.area is true - is config.fill
+// falling back to config.color, then #00e600 (line_chart.js
+// backgroundColor default). borderWidth is config.thickness (Chart.js
+// default 3). The 0.1 tension is approximated with straight segments
+// (documented deviation).
 func drawLineChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, rd map[string]metrics.Reading) {
 	s := rd[w.Sensor]
 	all := chartSeries(w, s)
@@ -327,9 +343,15 @@ func drawLineChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, r
 	}
 	stroke := w.Outline
 	if stroke == "" {
+		stroke = w.Color // the editor's "цвет линии" writes w.color
+	}
+	if stroke == "" {
 		stroke = "#4d4d4d" // line_chart.js borderColor default
 	}
 	area := w.Fill
+	if area == "" {
+		area = w.Color
+	}
 	if area == "" {
 		area = "#00e600" // line_chart.js backgroundColor default
 	}
@@ -364,10 +386,13 @@ func drawLineChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, r
 // ---- bar chart ----
 
 // drawBarChart mirrors bar_chart.js (Chart.js bar chart): one bar per
-// history point, config.thickness px wide (barThickness default 1) with a
-// 1 px config.outline border and config.fill fill (#00e600 default).
-// horizontal maps to indexAxis 'y'. The config.zoom drawImage stretch
-// trick is not reproduced (documented deviation).
+// history point, config.thickness px wide (barThickness default 1),
+// filled with config.fill falling back to config.color then #00e600
+// (bar_chart.js backgroundColor default) and outlined with config.outline
+// (#4d4d4d default) - but only when the bar is at least 2 px wide: a 1 px
+// stroke around a 1 px bar bleeds half a pixel into the neighbouring
+// bars. horizontal maps to indexAxis 'y'. The config.zoom drawImage
+// stretch trick is not reproduced (documented deviation).
 func drawBarChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, rd map[string]metrics.Reading) {
 	s := rd[w.Sensor]
 	all := chartSeries(w, s)
@@ -386,6 +411,9 @@ func drawBarChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, rd
 	}
 	fill := w.Fill
 	if fill == "" {
+		fill = w.Color // new bar widgets carry w.color (editor default)
+	}
+	if fill == "" {
 		fill = "#00e600" // bar_chart.js backgroundColor default
 	}
 	border := w.Outline
@@ -396,22 +424,31 @@ func drawBarChart(ctx *canvas.Context, x, y, ww, hh float64, w config.Widget, rd
 	if thick <= 0 {
 		thick = 1 // bar_chart.js barThickness default
 	}
-	ctx.SetStroke(canvas.Hex(border))
-	ctx.SetStrokeWidth(1)
+	// 1 px bars get no border: the stroke would bleed half a pixel into
+	// the neighbouring bars (centres sit ww/n apart).
+	borderOK := thick >= 2
+	if borderOK {
+		ctx.SetStroke(canvas.Hex(border))
+		ctx.SetStrokeWidth(1)
+	}
 	for i, v := range pts {
 		frac := clamp01((v - lo) / (hi - lo))
 		if w.Horizontal {
 			c := y + float64(i)/float64(n)*hh
 			ctx.SetFill(canvas.Hex(fill))
 			fillRect(ctx, x, c-thick/2, ww*frac, thick)
-			strokeRect(ctx, x, c-thick/2, ww*frac, thick)
+			if borderOK {
+				strokeRect(ctx, x, c-thick/2, ww*frac, thick)
+			}
 			continue
 		}
 		c := x + float64(i)/float64(n)*ww
 		bh := frac * hh
 		ctx.SetFill(canvas.Hex(fill))
 		fillRect(ctx, c-thick/2, y+hh-bh, thick, bh)
-		strokeRect(ctx, c-thick/2, y+hh-bh, thick, bh)
+		if borderOK {
+			strokeRect(ctx, c-thick/2, y+hh-bh, thick, bh)
+		}
 	}
 }
 
@@ -448,10 +485,15 @@ func rgbOf(s string) color.RGBA {
 type imageEntry struct {
 	mtime time.Time
 	img   image.Image
+	used  time.Time // last hit, drives LRU eviction
 }
 
 // imageCache mirrors the image.js _private.image: a decoded image stays
-// cached per path; the mtime check reproduces the reload-on-change.
+// cached per path; the mtime check reproduces the reload-on-change. Unlike
+// the Node original (which never evicted), the cache is LRU-bounded so
+// swapping wallpapers and themes cannot grow the daemon's RSS endlessly.
+const imageCacheMax = 32
+
 var (
 	imageCacheMu sync.Mutex
 	imageCache   = map[string]imageEntry{}
@@ -466,6 +508,8 @@ func loadImageFile(path string) (image.Image, error) {
 	imageCacheMu.Lock()
 	defer imageCacheMu.Unlock()
 	if e, ok := imageCache[path]; ok && e.mtime.Equal(st.ModTime()) {
+		e.used = time.Now()
+		imageCache[path] = e
 		return e.img, nil
 	}
 	f, err := os.Open(path)
@@ -477,7 +521,17 @@ func loadImageFile(path string) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	imageCache[path] = imageEntry{st.ModTime(), img}
+	if len(imageCache) >= imageCacheMax {
+		victim := ""
+		var oldest time.Time
+		for p, e := range imageCache {
+			if victim == "" || e.used.Before(oldest) {
+				victim, oldest = p, e.used
+			}
+		}
+		delete(imageCache, victim)
+	}
+	imageCache[path] = imageEntry{st.ModTime(), img, time.Now()}
 	return img, nil
 }
 

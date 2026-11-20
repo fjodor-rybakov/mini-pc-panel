@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 type fakeSensor struct {
@@ -70,7 +72,8 @@ func TestSensorNamesMatchOriginal(t *testing.T) {
 		"cpu_usage":      CPUUsage(1).Name(),
 		"memory":         Memory(1).Name(),
 		"space_root":     Space("/", 1).Name(),
-		"space_/home":    Space("/home", 1).Name(),
+		"space_home":     Space("/home", 1).Name(),
+		"space_mnt_data": Space("/mnt/data", 1).Name(),
 		"network_enp2s0": Network("enp2s0", 1, 1.5, "").Name(),
 	}
 	for wantName, got := range want {
@@ -268,6 +271,10 @@ func fakePowercapTree(t *testing.T, energy string) string {
 
 func TestCPUPowerRAPLDeltas(t *testing.T) {
 	rapl := fakePowercapTree(t, "1000000")
+	zone := filepath.Join(rapl, "intel_cpu_00")
+	if err := os.WriteFile(filepath.Join(zone, "max_energy_range_uj"), []byte("4000000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	s := CPUPower(rapl, fakeHWmonTree(t), []string{"coretemp"}, []string{"Package power"}, 4)
 	rd, err := s.Sample()
 	if err != nil {
@@ -276,25 +283,118 @@ func TestCPUPowerRAPLDeltas(t *testing.T) {
 	if rd.Value != 0 {
 		t.Fatalf("first sample = %v, want 0 (no previous counters)", rd.Value)
 	}
-	if err := os.WriteFile(filepath.Join(rapl, "intel_cpu_00", "energy_uj"), []byte("3000000"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(zone, "energy_uj"), []byte("3000000"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(1100 * time.Millisecond) // dt ≥ 1.1 s keeps the watt bounds stable
 	rd, err = s.Sample()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 2 000 000 µJ delta over a sub-second gap: the original only divides
-	// when the sample gap exceeds 1 s.
-	if rd.Value != 2 {
-		t.Fatalf("Value = %v, want 2 W", rd.Value)
-	}
-	// History is zero-prefilled to max_points (4), so the join token keeps
-	// the leading zeros exactly like the original shift-based buffer.
-	if rd.Text[1] != "0,0,0,2" {
-		t.Fatalf("history join = %q, want \"0,0,0,2\"", rd.Text[1])
+	// 2 000 000 µJ over ~1.1 s. Behaviour change: the energy delta is now
+	// ALWAYS divided by the real gap (the original divided only when the
+	// gap exceeded 1 s, reporting raw microjoules as watts on sub-second
+	// ticks).
+	if rd.Value < 1.3 || rd.Value > 2.2 {
+		t.Fatalf("Value = %v W, want ~1.8 (2 J over ~1.1 s)", rd.Value)
 	}
 	if rd.Max != 28 {
 		t.Fatalf("Max = %v, want 28 (original fixed scale)", rd.Max)
+	}
+	// energy_uj is a free-running counter that wraps at max_energy_range_uj.
+	// The original counted the wrap as a -2.5 J negative spike; now it is
+	// clamped: 500000 + 4000000 - 3000000 = 1.5 J over ~1.1 s.
+	if err := os.WriteFile(filepath.Join(zone, "energy_uj"), []byte("500000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	rd, err = s.Sample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.Value < 0.9 || rd.Value > 1.5 {
+		t.Fatalf("Value = %v W after counter wrap, want ~1.4 (1.5 J over ~1.1 s)", rd.Value)
+	}
+}
+
+// Sub-zones (intel-rapl:N:M) report energy that is already inside the
+// parent top-level zone (intel-rapl:N); summing both double counts. Zone
+// dir names contain ':' which NTFS forbids, so this runs on Linux hosts
+// only — the production target.
+func TestCPUPowerSkipsSubZones(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("RAPL zone dir names contain ':', uncreatable on NTFS")
+	}
+	root := t.TempDir()
+	parent := filepath.Join(root, "intel-rapl:0")
+	sub := filepath.Join(root, "intel-rapl:0:1")
+	for _, d := range []string{parent, sub} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "max_energy_range_uj"), []byte("10000000"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(parent, "energy_uj"), []byte("1000000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "energy_uj"), []byte("1000000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := CPUPower(root, t.TempDir(), nil, nil, 4)
+	if _, err := s.Sample(); err != nil {
+		t.Fatal(err)
+	}
+	// Parent +2 J, sub-zone +0.5 J (a subset of the parent's energy).
+	if err := os.WriteFile(filepath.Join(parent, "energy_uj"), []byte("3000000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "energy_uj"), []byte("1500000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	rd, err := s.Sample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ~1.8 W when only the parent counts; summing both gives ~2.3 W.
+	if rd.Value < 1.3 || rd.Value > 2.1 {
+		t.Fatalf("Value = %v W, want ~1.8 (sub-zone must not be summed)", rd.Value)
+	}
+}
+
+// Regression: Fahrenheit converted the ABSENT sibling max too (0 °C ->
+// 32 °F), which then satisfied the "sibMax > 0" case and set Max=32 <
+// Min=70 — the 230 °F default was unreachable.
+func TestHwmonTempFahrenheitDefaultMax(t *testing.T) {
+	s := HwmonTemp(fakeHWmonTree(t), TempOptions{Chips: []string{"coretemp"}, Labels: []string{"NoSuchLabel"}, Fahrenheit: true, MaxPoints: 1})
+	rd, err := s.Sample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.Value != 95 { // temp1_input fallback: 35 °C -> 95 °F
+		t.Fatalf("Value = %v, want 95 °F", rd.Value)
+	}
+	if rd.Max != 230 || rd.Min != 70 {
+		t.Fatalf("Min/Max = %v/%v, want 70/230 (default Fahrenheit scale)", rd.Min, rd.Max)
+	}
+}
+
+// The plain *_input fallback must walk the chip list in priority order:
+// with the default chips (coretemp first, nvme last) the old lexicographic
+// hwmonN scan handed nvme's power1_input to cpu_power.
+func TestCPUPowerHwmonFallbackChipPriority(t *testing.T) {
+	root := t.TempDir()
+	writeHWmon(t, root, "hwmon0", "nvme", map[string]string{"power1_label": "Power 1", "power1_input": "5000000"})
+	writeHWmon(t, root, "hwmon1", "coretemp", map[string]string{"power1_input": "15000000"})
+	s := CPUPower(t.TempDir(), root, []string{"coretemp", "nvme"}, []string{"NoSuchPowerLabel"}, 1)
+	rd, err := s.Sample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.Value != 15 {
+		t.Fatalf("Value = %v W, want 15 (coretemp outranks nvme by chip priority)", rd.Value)
 	}
 }
 

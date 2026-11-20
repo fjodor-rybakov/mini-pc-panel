@@ -187,3 +187,49 @@ func TestSplitRect(t *testing.T) {
 		t.Fatalf("degenerate rect must yield nil, got %+v", got)
 	}
 }
+
+// Regression for demo.json's custom_bar (300x6): 1800 px fits MaxUpdatePixels
+// but width 300 does NOT fit the uint8 header side, so the old early-return
+// made Update reject every partial refresh of the bar. Every piece must be
+// valid for one update packet, and cover the parent exactly.
+func TestSplitRectWideBarFitsUint8Sides(t *testing.T) {
+	r := Rect{X: 10, Y: 162, Width: 300, Height: 6}
+	subs := SplitRect(r)
+	if len(subs) < 2 {
+		t.Fatalf("300x6 must split for the uint8 header, got %d rects", len(subs))
+	}
+	total := 0
+	for _, s := range subs {
+		if s.Width <= 0 || s.Height <= 0 || s.Width > 255 || s.Height > 255 {
+			t.Fatalf("sub-rect %dx%d not valid for one update packet", s.Width, s.Height)
+		}
+		if s.Width*s.Height > MaxUpdatePixels {
+			t.Fatalf("sub-rect %dx%d exceeds %d px", s.Width, s.Height, MaxUpdatePixels)
+		}
+		total += s.Width * s.Height
+	}
+	if total != r.Width*r.Height {
+		t.Fatalf("coverage %d px, want %d", total, r.Width*r.Height)
+	}
+}
+
+// Oversized pixel input must not spill past the 4096-byte payload, and a
+// negative side (caller bug) must not slice the packet buffer backwards.
+func TestUpdatePacketPixelCaps(t *testing.T) {
+	p := UpdatePacket(0, 0, 10, 10, bytes.Repeat([]byte{0xCD}, PayloadSize))
+	if !bytes.Equal(p[HeaderSize:HeaderSize+200], bytes.Repeat([]byte{0xCD}, 200)) {
+		t.Fatal("10x10 pixels must occupy exactly the first 200 payload bytes")
+	}
+	allZero(t, p[HeaderSize+200:], "oversized pixel input must not spill")
+
+	big := UpdatePacket(0, 0, 255, 255, bytes.Repeat([]byte{0x77}, 2*PayloadSize))
+	if !bytes.Equal(big[HeaderSize:], bytes.Repeat([]byte{0x77}, PayloadSize)) {
+		t.Fatal("255x255 (130050 px) must fill the payload, capped at 4096 bytes")
+	}
+
+	neg := UpdatePacket(0, 0, -4, 2, []byte{1, 2, 3})
+	if len(neg) != PacketSize {
+		t.Fatalf("len %d", len(neg))
+	}
+	allZero(t, neg[HeaderSize:], "negative width must produce an empty payload, not a panic")
+}

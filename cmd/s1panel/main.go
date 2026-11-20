@@ -5,11 +5,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/app"
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
@@ -52,11 +56,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var httpSrv *server.Server
 	if admin != "" {
-		srv := server.New(a, admin)
+		httpSrv = server.New(a, admin)
 		go func() {
-			log.Printf("editor on http://localhost%s", admin)
-			if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
+			log.Printf("editor on http://%s", editorURL(admin))
+			err := httpSrv.ListenAndServe()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
 				log.Printf("server: %v", err)
 			}
 		}()
@@ -65,6 +71,26 @@ func main() {
 	if err := a.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
+	// Stop accepting editor requests before closing the panel: an
+	// in-flight /api/preview or /api/theme must finish (or fail) before
+	// the HID/serial handles go away.
+	if httpSrv != nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(sctx); err != nil {
+			log.Printf("server shutdown: %v", err)
+		}
+	}
 	display.Shutdown() // hid.Exit() on Linux, no-op elsewhere
 	log.Printf("bye")
+}
+
+// editorURL renders the listen address as a clickable URL: ":8686" needs
+// a host; an explicit bind like "0.0.0.0:8686" is shown as-is (the old
+// "http://localhost%s" format produced "http://localhost0.0.0.0:8686").
+func editorURL(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "localhost" + addr
+	}
+	return addr
 }

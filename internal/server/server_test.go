@@ -61,6 +61,10 @@ func (f *fakePanel) LatestReadings() map[string]metrics.Reading {
 func (f *fakePanel) Theme() *config.Theme    { return f.theme }
 func (f *fakePanel) CurrentScreenIndex() int { return 0 }
 func (f *fakePanel) Config() *config.Config  { return f.cfg }
+
+func (f *fakePanel) ThemeFile() string { return f.cfg.ThemeFile }
+
+func (f *fakePanel) SetThemeFile(path string) { f.cfg.ThemeFile = path }
 func (f *fakePanel) SwapTheme(t *config.Theme) {
 	f.theme = t
 	f.swapped++

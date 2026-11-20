@@ -5,6 +5,7 @@ import (
 
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/led"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 )
 
 func TestDeviceRectLandscapeIsIdentity(t *testing.T) {
@@ -28,6 +29,33 @@ func TestDeviceRectPortrait(t *testing.T) {
 	wantFull := config.Rect{X: 0, Y: 0, Width: 320, Height: 170}
 	if got := DeviceRect(full, true); got != wantFull {
 		t.Fatalf("portrait full screen: got %+v, want %+v", got, wantFull)
+	}
+}
+
+// Regression for the hot-swap panic: the poll tick reads themeDirty, then
+// /api/theme swaps in a SHORTER screens list before rotateScreen runs with
+// the stale index — screens[stale] panicked (no recover anywhere). The
+// swap now resets screenIdx, and rotateScreen clamps defensively.
+func TestSwapThemeShorterScreensDoNotPanic(t *testing.T) {
+	big := &config.Theme{Screens: []config.Screen{
+		{ID: 1, Duration: 10000}, {ID: 2, Duration: 10000}, {ID: 3, Duration: 10000},
+	}}
+	small := &config.Theme{Screens: []config.Screen{
+		{ID: 1, Duration: 10000}, {ID: 2, Duration: 10000},
+	}}
+	// Empty registry: SwapTheme re-checks sensor names and dereferences it.
+	a := &App{cfg: &config.Config{}, registry: metrics.NewRegistry(), theme: big, screenIdx: 2}
+
+	// The exact race window: tick latched dirty=false, then the swap landed.
+	a.theme = small
+	a.rotateScreen() // used to panic: small.Screens[2]
+	if a.screenIdx < 0 || a.screenIdx >= len(small.Screens) {
+		t.Fatalf("stale index survived rotateScreen: %d", a.screenIdx)
+	}
+
+	a.SwapTheme(small)
+	if a.screenIdx != 0 {
+		t.Fatalf("SwapTheme must reset screenIdx, got %d", a.screenIdx)
 	}
 }
 

@@ -101,8 +101,10 @@ func RGB565FromRGBA(img *image.RGBA) []byte {
 }
 
 // Region extracts a row-major RGB565 blob for the rectangle (x,y,w,h); the
-// app hands it straight to display.Update.
+// app hands it straight to display.Update. The rect is clipped to the
+// frame, so an out-of-bounds rect yields its intersection (never a panic).
 func (f *Frame) Region(x, y, w, h int) []byte {
+	x, y, w, h = f.clip(x, y, w, h)
 	out := make([]byte, w*h*2)
 	for row := 0; row < h; row++ {
 		src := ((y+row)*f.Width + x) * 2
@@ -112,10 +114,13 @@ func (f *Frame) Region(x, y, w, h int) []byte {
 }
 
 // SameRegion reports whether two frames hold identical pixels in the rect.
+// Like Region the rect is clipped to the frame; a rect that misses the
+// frame entirely compares equal (there is nothing to compare).
 func (f *Frame) SameRegion(other *Frame, x, y, w, h int) bool {
 	if other == nil || other.Width != f.Width || other.Height != f.Height {
 		return false
 	}
+	x, y, w, h = f.clip(x, y, w, h)
 	for row := 0; row < h; row++ {
 		o := ((y+row)*f.Width + x) * 2
 		if !bytes.Equal(f.Pixels[o:o+w*2], other.Pixels[o:o+w*2]) {
@@ -123,6 +128,26 @@ func (f *Frame) SameRegion(other *Frame, x, y, w, h int) bool {
 		}
 	}
 	return true
+}
+
+// clip intersects (x,y,w,h) with the frame bounds, returning the
+// non-negative intersection rect.
+func (f *Frame) clip(x, y, w, h int) (int, int, int, int) {
+	if x < 0 {
+		w += x
+		x = 0
+	}
+	if y < 0 {
+		h += y
+		y = 0
+	}
+	if x+w > f.Width {
+		w = f.Width - x
+	}
+	if y+h > f.Height {
+		h = f.Height - y
+	}
+	return x, y, max(w, 0), max(h, 0)
 }
 
 // WritePNG encodes the frame as PNG (editor previews in the browser).

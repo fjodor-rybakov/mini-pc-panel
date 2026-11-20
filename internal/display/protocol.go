@@ -74,7 +74,17 @@ func UpdatePacket(x, y, width, height int, pixels []byte) []byte {
 	binary.LittleEndian.PutUint16(p[4:6], uint16(y))
 	p[6] = byte(width)
 	p[7] = byte(height)
-	copy(p[HeaderSize:], pixels)
+	// Copy only the w*h*2 region: oversized input must not spill past the
+	// payload (and negative width/height must not slice backwards).
+	n := width * height * 2
+	if n < 0 {
+		n = 0 // negative side (caller error): send an empty region, no panic
+	}
+	if n > PayloadSize {
+		n = PayloadSize
+	}
+	n = min(n, len(pixels)) // short input stays zero-padded, like redraw chunks
+	copy(p[HeaderSize:HeaderSize+n], pixels)
 	return p
 }
 
@@ -176,7 +186,10 @@ func SplitRect(r Rect) []Rect {
 	if r.Width <= 0 || r.Height <= 0 {
 		return nil
 	}
-	if r.Width*r.Height <= MaxUpdatePixels {
+	// Both bounds matter: the packet header carries width/height as uint8,
+	// so a 300x6 bar (1800 px <= MaxUpdatePixels) still must be split —
+	// Update would otherwise reject every partial refresh of it.
+	if r.Width*r.Height <= MaxUpdatePixels && r.Width <= 255 && r.Height <= 255 {
 		return []Rect{r}
 	}
 	const side = 45

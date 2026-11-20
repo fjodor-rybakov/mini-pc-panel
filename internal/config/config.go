@@ -10,6 +10,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,6 +31,12 @@ func (h *HexUint16) UnmarshalJSON(data []byte) error {
 	}
 	switch t := v.(type) {
 	case float64:
+		// The old uint16(t) conversion silently truncated: 70000 became
+		// 4464 and 0x1_04D9 became 0x04D9 — a config typo would hunt for a
+		// random device instead of failing loudly.
+		if t < 0 || t > 65535 || t != math.Trunc(t) {
+			return fmt.Errorf("config: %v is not a uint16", t)
+		}
 		*h = HexUint16(uint16(t))
 	case string:
 		n, err := strconv.ParseUint(strings.TrimSpace(t), 0, 16)
@@ -186,17 +193,55 @@ func Load(path string) (*Config, error) {
 	cfg.applyDefaults()
 	cfg.Dir = filepath.Dir(path)
 	if cfg.ThemeFile != "" && !filepath.IsAbs(cfg.ThemeFile) {
-		cfg.ThemeFile = filepath.Join(cfg.Dir, cfg.ThemeFile)
+		cfg.ThemeFile, err = joinInDir(cfg.Dir, cfg.ThemeFile)
+		if err != nil {
+			return nil, fmt.Errorf("config: %w", err)
+		}
 	}
 	if cfg.ThemeFile == "" {
 		return nil, fmt.Errorf("config: theme_file is required")
 	}
 	for i := range cfg.ThemeList {
 		if cfg.ThemeList[i].File != "" && !filepath.IsAbs(cfg.ThemeList[i].File) {
-			cfg.ThemeList[i].File = filepath.Join(cfg.Dir, cfg.ThemeList[i].File)
+			cfg.ThemeList[i].File, err = joinInDir(cfg.Dir, cfg.ThemeList[i].File)
+			if err != nil {
+				return nil, fmt.Errorf("config: theme_list[%d]: %w", i, err)
+			}
 		}
 	}
+	if err := cfg.validateLED(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// joinInDir resolves a config-relative path under dir and refuses ".."
+// escapes: the original joined blindly, so "theme_file": "../../etc/x"
+// reached outside the config directory. Absolute paths are an explicit
+// user choice and are not checked.
+func joinInDir(dir, rel string) (string, error) {
+	joined := filepath.Join(dir, rel)
+	r, err := filepath.Rel(dir, joined)
+	if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%q escapes the config directory %s", rel, dir)
+	}
+	return joined, nil
+}
+
+// validateLED rejects out-of-range LED knobs before they reach the wire:
+// fix_value() clamps silently, so a typo (theme 9, speed 0) would run a
+// different effect than configured instead of failing loudly.
+func (c *Config) validateLED() error {
+	if c.LED.Theme < 1 || c.LED.Theme > 6 {
+		return fmt.Errorf("config: led theme %d out of range 1..6", c.LED.Theme)
+	}
+	if c.LED.Intensity < 1 || c.LED.Intensity > 5 {
+		return fmt.Errorf("config: led intensity %d out of range 1..5", c.LED.Intensity)
+	}
+	if c.LED.Speed < 1 || c.LED.Speed > 5 {
+		return fmt.Errorf("config: led speed %d out of range 1..5", c.LED.Speed)
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -522,12 +567,20 @@ func Validate(t *Theme) error {
 	ow, oh, _ := t.OrientationSize()
 	for i := range t.Screens {
 		sc := &t.Screens[i]
+		// Duplicate ids make the editor and /api/next_screen?id=N ambiguous
+		// (and the original looked screens up BY id), so reject them.
+		if i > 0 && sc.ID == t.Screens[i-1].ID {
+			return fmt.Errorf("duplicate screen id %d", sc.ID)
+		}
 		if sc.IsEnabled() {
 			anyEnabled = true
 		}
 		sort.SliceStable(sc.Widgets, func(a, b int) bool { return sc.Widgets[a].ID < sc.Widgets[b].ID })
 		for j := range sc.Widgets {
 			w := &sc.Widgets[j]
+			if j > 0 && w.ID == sc.Widgets[j-1].ID {
+				return fmt.Errorf("screen %d: duplicate widget id %d", sc.ID, w.ID)
+			}
 			if w.Type == "" {
 				w.Type = "text"
 			}
