@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
+	"github.com/fjodor-rybakov/mini-pc-panel/internal/led"
 )
 
 func TestDeviceRectLandscapeIsIdentity(t *testing.T) {
@@ -27,5 +28,47 @@ func TestDeviceRectPortrait(t *testing.T) {
 	wantFull := config.Rect{X: 0, Y: 0, Width: 320, Height: 170}
 	if got := DeviceRect(full, true); got != wantFull {
 		t.Fatalf("portrait full screen: got %+v, want %+v", got, wantFull)
+	}
+}
+
+// Regression for "LED off doesn't work": an "off" pushed from the editor
+// used to be undone by the very next screen rotation, which re-applied the
+// config's global theme. Manual settings must be the live global instead
+// (a screen's own led_config still wins), and theme 0 — which the old code
+// silently clamped into rainbow — must be rejected. led.Device{} has no
+// serial port, so every wire write is a silent no-op: no hardware needed.
+func TestManualLEDOffSurvivesRotation(t *testing.T) {
+	cfg := &config.Config{}
+	on := true
+	cfg.LED.Enabled = &on
+	cfg.LED.LEDSettings = config.LEDSettings{Theme: 5, Intensity: 3, Speed: 3}
+	a := &App{cfg: cfg, led: &led.Device{}}
+
+	if err := a.ApplyLEDManual(config.LEDSettings{Theme: led.ThemeOff, Intensity: 3, Speed: 3}); err != nil {
+		t.Fatalf("ApplyLEDManual(off): %v", err)
+	}
+	if a.lastLEDTheme != led.ThemeOff {
+		t.Fatalf("after manual off: lastLEDTheme = %d, want %d", a.lastLEDTheme, led.ThemeOff)
+	}
+	if err := a.ApplyLEDManual(config.LEDSettings{Theme: 0}); err == nil {
+		t.Fatal("theme 0 must be rejected, not sent as rainbow")
+	}
+	if a.manualLED == nil || a.manualLED.Theme != led.ThemeOff {
+		t.Fatalf("rejected call must not replace the manual settings: %+v", a.manualLED)
+	}
+
+	// The rotation path that used to re-apply config theme 5 over the off.
+	a.applyScreenLED(&config.Screen{ID: 1, Name: "s"})
+	if a.lastLEDTheme != led.ThemeOff {
+		t.Fatalf("after rotation: lastLEDTheme = %d, want %d — manual off must outrank the config theme",
+			a.lastLEDTheme, led.ThemeOff)
+	}
+
+	// A screen with its own led_config still outranks the manual global.
+	sc := &config.Screen{ID: 2, Name: "s2", LED: &config.LEDSettings{Theme: led.ThemeRainbow, Intensity: 2, Speed: 2}}
+	a.applyScreenLED(sc)
+	if a.lastLEDTheme != led.ThemeRainbow {
+		t.Fatalf("screen led_config must outrank manual settings: lastLEDTheme = %d, want %d",
+			a.lastLEDTheme, led.ThemeRainbow)
 	}
 }

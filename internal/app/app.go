@@ -41,6 +41,8 @@ type App struct {
 	readings      map[string]metrics.Reading
 	previewUntil  time.Time
 	lastHeartbeat time.Time
+	manualLED     *config.LEDSettings // editor-driven LED set (outranks config)
+	lastLEDTheme  int                 // mode the strip now holds (0 = nothing sent)
 }
 
 // New opens the hardware and loads the theme; it does not start traffic yet.
@@ -78,6 +80,7 @@ func New(cfg *config.Config) (*App, error) {
 			a.led = dev
 		}
 	}
+	a.warnUnknownSensors(theme)
 	return a, nil
 }
 
@@ -113,6 +116,7 @@ func BuildRegistry(cfg *config.Config) *metrics.Registry {
 func (a *App) Run(ctx context.Context) error {
 	a.disp.Start(ctx)
 	defer func() {
+		a.shutdownLED()
 		a.led.Close()
 		a.disp.Close()
 	}()
@@ -420,12 +424,19 @@ func (a *App) applyScreenLED(sc *config.Screen) {
 // theme||4 on screen change but led_thread.js re-applied the global
 // settings every 3 s; there is no such loop here, so inheriting the global
 // defaults (config defaults to theme 5/3/3) is the documented deviation.
-// Callers hold a.mu (rotateScreen) or run single-threaded before the loop.
+// The global side of that merge starts from the editor's manual settings
+// when present (manualLED): without that, an "off" pushed from the editor
+// was undone by the very next screen rotation, which re-applied the config
+// theme. Callers hold a.mu (rotateScreen) or run single-threaded before
+// the loop.
 func (a *App) applyScreenLEDLocked(sc *config.Screen) {
 	if a.led == nil || sc == nil {
 		return
 	}
 	s := a.cfg.LED.LEDSettings
+	if a.manualLED != nil {
+		s = *a.manualLED
+	}
 	if sc.LED != nil {
 		if sc.LED.Theme != 0 {
 			s.Theme = sc.LED.Theme
@@ -443,28 +454,67 @@ func (a *App) applyScreenLEDLocked(sc *config.Screen) {
 	case led.ThemeOff:
 		if err := a.led.Off(); err != nil {
 			log.Printf("app: led off: %v", err)
+		} else {
+			a.lastLEDTheme = s.Theme
 		}
 	default:
 		if err := a.led.Set(s.Theme, s.Intensity, s.Speed); err != nil {
 			log.Printf("app: led set: %v", err)
+		} else {
+			a.lastLEDTheme = s.Theme
 		}
 	}
 }
 
 // ApplyLEDManual pushes explicit strip settings (editor "apply LED" action).
 // Config-scale intensity/speed; theme 6 sends nothing (original ignore).
+// The settings also become the live global for every later screen change,
+// so an editor "off" is no longer undone by the next rotation. They last
+// for the process lifetime only: the daemon never writes config.json, so a
+// restart falls back to its led block.
 func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 	if a.led == nil {
 		return fmt.Errorf("app: led device not open")
 	}
+	if settings.Theme < led.ThemeRainbow || settings.Theme > led.ThemeIgnore {
+		return fmt.Errorf("app: led: theme must be 1..6, got %d", settings.Theme)
+	}
 	switch settings.Theme {
 	case led.ThemeIgnore:
 		log.Printf("app: led theme 6 (ignore): no packet sent")
-		return nil
 	case led.ThemeOff:
-		return a.led.Off()
+		if err := a.led.Off(); err != nil {
+			return err
+		}
 	default:
-		return a.led.Set(settings.Theme, settings.Intensity, settings.Speed)
+		if err := a.led.Set(settings.Theme, settings.Intensity, settings.Speed); err != nil {
+			return err
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if settings.Theme != led.ThemeIgnore {
+		a.lastLEDTheme = settings.Theme
+	}
+	m := settings
+	a.manualLED = &m
+	return nil
+}
+
+// shutdownLED turns the strip off when the daemon exits while it had been
+// driving it: the CH340 controller latches its last mode, so a stopped (or
+// afterwards led.enabled=false) daemon would otherwise leave the strip
+// burning. When the strip was never touched, or left alone via theme 6
+// ("ignore"), nothing is sent.
+func (a *App) shutdownLED() {
+	a.mu.Lock()
+	last := a.lastLEDTheme
+	a.mu.Unlock()
+	if a.led == nil || last == 0 || last == led.ThemeIgnore {
+		return
+	}
+	if err := a.led.Off(); err != nil {
+		log.Printf("app: led off on shutdown: %v", err)
 	}
 }
 
@@ -499,6 +549,26 @@ func (a *App) SwapTheme(t *config.Theme) {
 	a.theme = t
 	a.themeDirty = true
 	a.mu.Unlock()
+	a.warnUnknownSensors(t)
+}
+
+// warnUnknownSensors logs every widget whose sensor the registry does not
+// sample. Such widgets render "N/A"/blank (widgets.go looks up rd[w.Sensor]
+// and finds no key); without this line the only trace is the registry's
+// rate-limited sampling error, which never mentions the theme.
+func (a *App) warnUnknownSensors(t *config.Theme) {
+	known := make(map[string]bool)
+	for _, n := range a.registry.Names() {
+		known[n] = true
+	}
+	for _, sc := range t.Screens {
+		for _, w := range sc.Widgets {
+			if w.Sensor != "" && !known[w.Sensor] {
+				log.Printf("app: theme: screen %q (id %d) widget %d (%s) references unknown sensor %q — it will render N/A/blank",
+					sc.Name, sc.ID, w.ID, w.Type, w.Sensor)
+			}
+		}
+	}
 }
 
 // Config returns the daemon configuration (read-only use by the server).

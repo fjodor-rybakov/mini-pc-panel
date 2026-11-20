@@ -30,7 +30,7 @@
           "id": 3,
           "type": "doughnut",
           "rect": { "x": 170, "y": 10, "width": 60, "height": 60 },
-          "sensor": "temp",
+          "sensor": "cpu_temp",
           "max": 110,
           "thickness": 6,
           "used": "#3f8cff",
@@ -40,7 +40,7 @@
           "id": 4,
           "type": "text",
           "rect": { "x": 170, "y": 72, "width": 60, "height": 14 },
-          "sensor": "temp",
+          "sensor": "cpu_temp",
           "format": "{v}°C",
           "align": "center",
           "font": { "size": 11 }
@@ -67,7 +67,7 @@
           "id": 7,
           "type": "text",
           "rect": { "x": 10, "y": 60, "width": 150, "height": 20 },
-          "sensor": "cpu",
+          "sensor": "cpu_usage",
           "format": "CPU: {v}%",
           "font": { "size": 14, "bold": true }
         },
@@ -75,7 +75,7 @@
           "id": 8,
           "type": "line_chart",
           "rect": { "x": 10, "y": 90, "width": 140, "height": 70 },
-          "sensor": "temp",
+          "sensor": "cpu_temp",
           "points": 60,
           "area": true,
           "max": 110,
@@ -86,7 +86,7 @@
           "id": 9,
           "type": "bar_chart",
           "rect": { "x": 160, "y": 90, "width": 140, "height": 70 },
-          "sensor": "power",
+          "sensor": "cpu_power",
           "points": 30,
           "fill": "#e0a53c",
           "outline": "#e0a53c"
@@ -95,7 +95,7 @@
           "id": 10,
           "type": "custom_bar",
           "rect": { "x": 10, "y": 162, "width": 300, "height": 6 },
-          "sensor": "cpu"
+          "sensor": "cpu_usage"
         }
       ]
     },
@@ -108,31 +108,31 @@
           "id": 1,
           "type": "text",
           "rect": { "x": 10, "y": 10, "width": 150, "height": 16 },
-          "sensor": "net_eth0_rx",
-          "format": "ETH ↓ {0}",
+          "sensor": "network_eth0",
+          "format": "ETH ↓ {3}",
           "font": { "size": 12 }
         },
         {
           "id": 2,
           "type": "text",
           "rect": { "x": 10, "y": 30, "width": 150, "height": 16 },
-          "sensor": "net_eth0_tx",
-          "format": "ETH ↑ {0}",
+          "sensor": "network_eth0",
+          "format": "ETH ↑ {6}",
           "font": { "size": 12 }
         },
         {
           "id": 3,
           "type": "text",
           "rect": { "x": 10, "y": 50, "width": 150, "height": 16 },
-          "sensor": "net_wlan0_rx",
-          "format": "WLAN ↓ {0}",
+          "sensor": "network_wlan0",
+          "format": "WLAN ↓ {3}",
           "font": { "size": 12 }
         },
         {
           "id": 4,
           "type": "doughnut",
           "rect": { "x": 170, "y": 10, "width": 60, "height": 60 },
-          "sensor": "power",
+          "sensor": "cpu_power",
           "thickness": 6,
           "used": "#e0a53c",
           "free": "#443322"
@@ -141,7 +141,7 @@
           "id": 5,
           "type": "text",
           "rect": { "x": 170, "y": 72, "width": 60, "height": 14 },
-          "sensor": "power",
+          "sensor": "cpu_power",
           "format": "{v} W",
           "align": "center",
           "font": { "size": 11 }
@@ -150,7 +150,7 @@
           "id": 6,
           "type": "line_chart",
           "rect": { "x": 10, "y": 90, "width": 300, "height": 70 },
-          "sensor": "cpu",
+          "sensor": "cpu_usage",
           "points": 60,
           "area": true,
           "max": 100,
