@@ -23,16 +23,17 @@ const validDraft = `{"orientation":"landscape","screens":[{"id":1,"widgets":[{"i
 // fakePanel implements Panel so the HTTP layer is exercised without any
 // HID/serial hardware.
 type fakePanel struct {
-	dir      string
-	cfg      *config.Config
-	theme    *config.Theme
-	swapped  int
-	previews int
-	next     int
-	shown    []int
-	pauses   []bool
-	lastLED  config.LEDSettings
-	ledErr   error
+	dir       string
+	cfg       *config.Config
+	theme     *config.Theme
+	swapped   int
+	previews  int
+	next      int
+	shown     []int
+	pauses    []bool
+	lastLED   config.LEDSettings
+	manualLED *config.LEDSettings
+	ledErr    error
 }
 
 func newPanel(t *testing.T) *fakePanel {
@@ -88,7 +89,19 @@ func (f *fakePanel) PreviewOnScreen(_ context.Context, t *config.Theme, idx int)
 
 func (f *fakePanel) ApplyLEDManual(s config.LEDSettings) error {
 	f.lastLED = s
+	if f.ledErr == nil {
+		f.manualLED = &s
+	}
 	return f.ledErr
+}
+
+// ManualLED mirrors app.App: a successful manual apply is what the daemon
+// keeps honouring, and /api/state must echo it back to the editor.
+func (f *fakePanel) ManualLED() (config.LEDSettings, bool) {
+	if f.manualLED == nil {
+		return config.LEDSettings{}, false
+	}
+	return *f.manualLED, true
 }
 
 func (f *fakePanel) NextScreen() { f.next++ }
@@ -320,6 +333,49 @@ func TestLEDApply(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("LED error: status %d, want 502", resp.StatusCode)
+	}
+}
+
+// The editor refills its LED form from /api/state on every page load. If
+// that reply carries only config defaults, a manual "off" (theme 4) looks
+// lost after a refresh and the next "apply" re-lights the strip - the
+// state must echo the live manual settings, merged over the config block.
+func TestStateEchoesManualLED(t *testing.T) {
+	ts, p := newTestServer(t)
+	p.cfg.LED.Port = "/dev/ttyUSB0"
+
+	resp, err := http.Post(ts.URL+"/api/led", "application/json", strings.NewReader(`{"theme":4,"intensity":3,"speed":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("led apply status %d", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Config struct {
+			LED struct {
+				Port      string `json:"port"`
+				Theme     int    `json:"theme"`
+				Intensity int    `json:"intensity"`
+				Speed     int    `json:"speed"`
+			} `json:"led"`
+		} `json:"config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Config.LED.Theme != 4 {
+		t.Errorf("state led.theme = %d after manual off, want 4", body.Config.LED.Theme)
+	}
+	if body.Config.LED.Port != "/dev/ttyUSB0" {
+		t.Errorf("state led.port = %q, manual merge must keep the config port", body.Config.LED.Port)
 	}
 }
 

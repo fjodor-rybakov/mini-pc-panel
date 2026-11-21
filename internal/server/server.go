@@ -41,6 +41,7 @@ type Panel interface {
 	PreviewFrame(t *config.Theme, screenIdx int) (*render.Frame, error)
 	PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx int) (*render.Frame, error)
 	ApplyLEDManual(s config.LEDSettings) error
+	ManualLED() (config.LEDSettings, bool)
 	NextScreen()
 	ShowScreen(id int) bool
 	PauseRotation(on bool)
@@ -158,9 +159,22 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"current_screen": s.app.CurrentScreenIndex(),
 		"config": map[string]any{
 			"theme_file": s.app.ThemeFile(),
-			"led":        s.app.Config().LED,
+			"led":        s.effectiveLED(),
 		},
 	})
+}
+
+// effectiveLED reports the strip settings the daemon is actually honouring:
+// the editor's last manual apply (live until daemon restart) merged over
+// the config's led block. Without the merge the editor refills its LED
+// form from config defaults (5/3/3) after a page refresh, and the next
+// "apply" re-lights a strip the user had just set to "off".
+func (s *Server) effectiveLED() config.LEDConfig {
+	led := s.app.Config().LED
+	if m, ok := s.app.ManualLED(); ok {
+		led.LEDSettings = m
+	}
+	return led
 }
 
 // handlePoll re-serves the latest readings (the daemon loop samples every
