@@ -237,6 +237,12 @@ func TestSaveStandby(t *testing.T) {
 	if re.Standby.Start != "6:45" || re.Standby.End != "8:15" {
 		t.Fatalf("reload = %+v, want 6:45-8:15", re.Standby)
 	}
+	// SaveStandby is file-only: the caller (App.SetStandbySchedule) swaps
+	// the live value under its own mutex, so the poll loop's cfg.Standby
+	// reads cannot race a silent mutation here.
+	if cfg.Standby.Start != "23:00" || cfg.Standby.End != "07:00" {
+		t.Errorf("SaveStandby mutated the live Config: %+v", cfg.Standby)
+	}
 	// The rest of the config survives the raw-JSON merge (Load makes
 	// theme_file absolute against the config dir, so compare the base).
 	if filepath.Base(re.ThemeFile) != "t.json" {
@@ -256,6 +262,7 @@ func TestSaveStandby(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeCfg := cfg.Standby
 	if err := SaveStandby(cfg, StandbyConfig{Start: "25:00", End: "07:00"}); err == nil {
 		t.Fatal("SaveStandby accepted start \"25:00\"")
 	}
@@ -266,8 +273,8 @@ func TestSaveStandby(t *testing.T) {
 	if string(before) != string(after) {
 		t.Fatal("refused SaveStandby must leave config.json byte-identical")
 	}
-	if cfg.Standby.Enabled() {
-		t.Fatalf("refused SaveStandby must not move cfg.Standby either: %+v", cfg.Standby)
+	if cfg.Standby != beforeCfg {
+		t.Fatalf("refused SaveStandby must not move cfg.Standby either: %+v -> %+v", beforeCfg, cfg.Standby)
 	}
 }
 
@@ -531,8 +538,14 @@ func TestSaveLEDPersistsAndKeepsUnknownKeys(t *testing.T) {
 	if err := SaveLED(cfg, want); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LED.LEDSettings != want {
-		t.Errorf("live config not updated: %+v", cfg.LED.LEDSettings)
+	// SaveLED is file-only: the caller (App.PersistLED) updates the live
+	// Config under its own mutex, so the poll loop's cfg.LED reads cannot
+	// race a silent mutation here. cfg.LED must still hold the loaded file.
+	if cfg.LED.LEDSettings == want {
+		t.Errorf("SaveLED mutated the live Config to %+v", cfg.LED.LEDSettings)
+	}
+	if cfg.LED.LEDSettings != (LEDSettings{Theme: 5, Intensity: 2, Speed: 4}) {
+		t.Errorf("loaded Config changed under SaveLED: %+v", cfg.LED.LEDSettings)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

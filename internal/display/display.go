@@ -28,8 +28,15 @@ type job struct {
 // with a mandatory pause between packets (spec §5.1): the HT32 firmware hangs
 // when fed too fast.
 type Display struct {
-	tr    Transport
-	delay time.Duration
+	tr Transport
+	// dial reopens the transport after a write failure (USB unplug/replug).
+	// nil = plain New(): the transport is never closed or replaced while the
+	// Display lives. Only the worker goroutine reads/writes tr, broken and
+	// trOpen; Close reads them AFTER wg.Wait(), so no lock is needed.
+	dial   func() (Transport, error)
+	broken bool // current tr is known dead; the next job must redial first
+	trOpen bool // tr still needs (and allows) a Close in Close()
+	delay  time.Duration
 	// redrawDelay mirrors config.refresh in the original main.js with_delay:
 	// the job after a 'redraw' waits this long before its first packet.
 	redrawDelay time.Duration
@@ -48,21 +55,38 @@ type Display struct {
 
 // New wraps a Transport. delay is the inter-packet pause (spec: 10 ms);
 // redrawDelay is the post-redraw pause from the original with_delay (0
-// selects the original default of 1600 ms, config.refresh).
+// selects the original default of 1600 ms, config.refresh). Write failures
+// are logged and counted but the Transport is NEVER closed or replaced -
+// callers own its lifetime (and tests reuse the same fake after a failure).
 func New(tr Transport, delay, redrawDelay time.Duration) *Display {
-	if delay <= 0 {
-		delay = 10 * time.Millisecond
-	}
-	if redrawDelay <= 0 {
-		redrawDelay = 1600 * time.Millisecond
-	}
 	return &Display{
 		tr:          tr,
+		trOpen:      true,
 		delay:       delay,
 		redrawDelay: redrawDelay,
 		queue:       make(chan *job, 256),
 		quit:        make(chan struct{}),
 	}
+}
+
+// NewWithReconnect is New plus a redial path: on the first write error the
+// worker closes the dead transport, and before the next job it reopens one
+// through dial with 1s..15s backoff (interruptible by ctx/quit). After a
+// successful reopen queued partial updates are dropped - the panel never
+// saw their predecessors, replaying them paints stale bands - while
+// heartbeat/orientation/redraw jobs survive, so the app's WriteFailures
+// resync latch repaints as soon as the link is back. tr may be nil to
+// start "already offline" (panel not plugged in at daemon start); dial
+// must not be nil.
+func NewWithReconnect(tr Transport, dial func() (Transport, error), delay, redrawDelay time.Duration) *Display {
+	if dial == nil {
+		panic("display: NewWithReconnect needs a dial function")
+	}
+	d := New(tr, delay, redrawDelay)
+	d.dial = dial
+	d.broken = tr == nil
+	d.trOpen = tr != nil
+	return d
 }
 
 // Start launches the single writer goroutine.
@@ -80,7 +104,17 @@ func (d *Display) worker(ctx context.Context) {
 		case <-d.quit:
 			return
 		case j := <-d.queue:
-			d.process(j)
+			if d.dial != nil && d.broken {
+				// Link died on the previous job: block here until dial
+				// yields a fresh transport (or ctx/quit ends the worker).
+				if !d.reconnect(ctx) {
+					return
+				}
+			}
+			failed := d.process(j)
+			if failed && d.dial != nil {
+				d.killTransport()
+			}
 			if j.label == "redraw" {
 				// Original with_delay (main.js): the NEXT job waits
 				// config.refresh ms after a full redraw.
@@ -96,8 +130,10 @@ func (d *Display) worker(ctx context.Context) {
 	}
 }
 
-// process runs on the worker goroutine only.
-func (d *Display) process(j *job) {
+// process runs on the worker goroutine only. It reports whether the job was
+// abandoned by a write error (the reconnect opt-in path uses that to mark
+// the transport dead).
+func (d *Display) process(j *job) (failed bool) {
 	// Field evidence (user's panel, Nov 2026): with the upstream
 	// lcd_device.js chaining — redraw chunks back-to-back, paced only by
 	// the device's NAK flow control — all 27 chunks cross the wire
@@ -119,7 +155,7 @@ func (d *Display) process(j *job) {
 			d.mu.Lock()
 			d.writeFails++
 			d.mu.Unlock()
-			return
+			return true
 		}
 		time.Sleep(d.delay) // spec §5.1: pause after every packet, redraw chunks included
 	}
@@ -127,6 +163,69 @@ func (d *Display) process(j *job) {
 	// field-debug aid (proving redraws reach the USB wire) and is now a
 	// 27-chunk line every repaint - noise. Real trouble still logs: the
 	// write-error branch above plus the app's WriteFailures resync latch.
+	return false
+}
+
+// killTransport closes the transport that just failed a write and arms the
+// redial path. Worker-goroutine only. Without dial configured (plain New)
+// the worker never calls this: the caller owns the Transport.
+func (d *Display) killTransport() {
+	if !d.trOpen {
+		return
+	}
+	d.trOpen = false
+	d.broken = true
+	if err := d.tr.Close(); err != nil {
+		log.Printf("display: closing dead transport: %v", err)
+	}
+	log.Printf("display: panel link is dead; reopening in the background")
+}
+
+// reconnect blocks until dial returns a working transport, backing off
+// 1s, 2s, 4s ... capped at 15s; every wait is interruptible by ctx/quit.
+// It reports whether d.tr is usable afterwards. Worker-goroutine only.
+func (d *Display) reconnect(ctx context.Context) bool {
+	const maxGap = 15 * time.Second
+	gap := time.Second
+	attempts := 0
+	lastLog := time.Time{}
+	for {
+		tr, err := d.dial()
+		if err == nil {
+			d.tr = tr
+			d.trOpen = true
+			d.broken = false
+			log.Printf("display: panel back online after %d reopen attempt(s)", attempts)
+			// Jobs queued while the link was dead are stale except the
+			// full-redraw/heartbeat/orientation commands: drop the partial
+			// tiles the panel never saw the start of. The app's
+			// WriteFailures latch forces the resync redraw from there.
+			if n := d.DropPending(); n > 0 {
+				log.Printf("display: dropped %d queued update job(s) accumulated while the panel was offline", n)
+			}
+			return true
+		}
+		attempts++
+		// The open error strings are long (enumerate/sysfs diagnosis):
+		// log the first one, then at most one per 30 s.
+		if attempts == 1 || time.Since(lastLog) >= 30*time.Second {
+			lastLog = time.Now()
+			log.Printf("display: reopen attempt %d failed: %v (retrying, next attempt in %s)", attempts, err, gap)
+		}
+		select {
+		case <-time.After(gap):
+		case <-ctx.Done():
+			return false
+		case <-d.quit:
+			return false
+		}
+		if gap < maxGap {
+			gap *= 2
+			if gap > maxGap {
+				gap = maxGap
+			}
+		}
+	}
 }
 
 // WriteFailures is the number of jobs abandoned mid-write since startup.
@@ -195,11 +294,18 @@ func (d *Display) DropPending() int {
 			}
 			keep = append(keep, j)
 		default:
+			lost := 0
 			for _, j := range keep {
 				select {
 				case d.queue <- j:
 				default: // queue refilled concurrently; dropping the rest is safe
+					lost++
 				}
+			}
+			if lost > 0 {
+				// Silent loss would hide a dropped heartbeat/queued redraw:
+				// the app resyncs via WriteFailures, but the log should say.
+				log.Printf("display: DropPending: queue refilled mid-drop, %d kept job(s) discarded too", lost)
 			}
 			return dropped
 		}
@@ -295,5 +401,11 @@ func (d *Display) Close() error {
 	d.mu.Unlock()
 	close(d.quit)
 	d.wg.Wait()
+	// Safe to read tr/trOpen here: the worker (the only other toucher) has
+	// exited. A reconnect-display whose dead transport killTransport already
+	// closed must not close the descriptor a second time (undefined for HID).
+	if !d.trOpen {
+		return nil
+	}
 	return d.tr.Close()
 }

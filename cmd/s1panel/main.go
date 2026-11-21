@@ -21,9 +21,16 @@ import (
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/server"
 )
 
+// version is stamped at build time by the Makefile
+// (-ldflags "-X main.version=$(git describe ...)"); the startup log line
+// is the deployment check ("is the new image actually running?") that the
+// old hardcoded "display pacing v4" marker used to serve.
+var version = "dev"
+
 func main() {
 	log.SetPrefix("s1panel: ")
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+	log.Printf("s1panel %s", version)
 
 	configPath := flag.String("config", "config.json", "daemon configuration file")
 	adminAddr := flag.String("admin", "", "editor HTTP listen address; defaults to the config's \"listen\" (pass -admin \"\" to disable)")
@@ -81,7 +88,7 @@ func main() {
 			log.Printf("server shutdown: %v", err)
 		}
 	}
-	display.Shutdown() // hid.Exit() on Linux, no-op elsewhere
+	display.Shutdown() // no-op now: hid.Init/Exit pair inside each transport Close
 	log.Printf("bye")
 }
 

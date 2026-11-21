@@ -100,7 +100,16 @@ func (t *hidTransport) Write(packet []byte) error {
 	return err
 }
 
-func (t *hidTransport) Close() error { return t.dev.Close() }
+// Close pairs the hid.Init done by OpenHID/OpenPath: every successful open
+// bumps hidapi's init refcount once, so every transport close must release
+// one. With reconnect (NewWithReconnect) the daemon opens/closes the panel
+// repeatedly, and deferring Exit to Shutdown would leave the reference
+// count growing across replug cycles.
+func (t *hidTransport) Close() error {
+	err := t.dev.Close()
+	hid.Exit()
+	return err
+}
 
 // probeScreenHidraw scans the read-only host sysfs for the panel's hidraw
 // nodes and returns the screen node — the panel interface whose report
@@ -175,5 +184,8 @@ func probeScreenHidraw(vid, pid uint16) (path string, iface int, bits int, diag 
 	}
 }
 
-// Shutdown releases the HID subsystem; call once after the last Display close.
-func Shutdown() { hid.Exit() }
+// Shutdown is kept for callers that used it after Display.Close; the Exit
+// now belongs to each transport's Close (Init/Exit pair), so this is a
+// no-op. Calling hid.Exit() here a second time would drop hidapi's
+// refcount below zero on reconnect builds.
+func Shutdown() {}

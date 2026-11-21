@@ -185,6 +185,7 @@ type Config struct {
 	Heartbeat   int                  `json:"heartbeat"`    // ms heartbeat threshold (original 60000)
 	RedrawDelay int                  `json:"redraw_delay"` // ms wait after a redraw job (original "refresh", 1600)
 	PacketDelay int                  `json:"packet_delay"` // ms between HID packets, spec §5.1 mandates 10
+	PreviewHold int                  `json:"preview_hold"` // ms an editor preview stays on screen before the theme resumes
 	Fonts       map[string]FontFiles `json:"fonts"`
 	Sensors     SensorsConfig        `json:"sensors"`
 	Standby     StandbyConfig        `json:"standby"` // software standby window (black screen, LED off)
@@ -251,6 +252,44 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// writeFileAtomic replaces path with data in one step: write a temp file in
+// the SAME directory, then rename over the target. A crash or ENOSPC halfway
+// through os.WriteFile would otherwise truncate config.json / a theme file
+// and the daemon could not start at all next time. rename(2) within one
+// directory is atomic on POSIX; on Windows the temp is unlinked first so
+// the rename cannot fail because the target exists.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename below succeeded
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		// Windows: rename over an existing file fails (POSIX replaces it).
+		if rmErr := os.Remove(path); rmErr != nil {
+			return err
+		}
+		return os.Rename(tmpName, path)
+	}
+	return nil
+}
+
 // SaveLED persists strip settings into the config file the daemon loaded,
 // mirroring the original set_led_strip (s1panel/api.js:309-316): every LED
 // apply from the GUI rewrote the led block in config.json, so an "off"
@@ -259,7 +298,10 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 // model (the original canvas/widgets/sensors entries) survive untouched, and
 // the block keeps the spelling the file already uses ("led" or the original
 // "led_config"); a file with neither gets "led". Port/enabled and any other
-// keys inside the block are left as they are.
+// keys inside the block are left as they are. SaveLED only touches the FILE:
+// cfg is read (Path) but never mutated, so callers holding a lock around the
+// live Config can update it themselves without racing another goroutine's
+// read.
 func SaveLED(cfg *Config, s LEDSettings) error {
 	if cfg.Path == "" {
 		return fmt.Errorf("config: no config file path recorded, cannot persist LED settings")
@@ -297,10 +339,9 @@ func SaveLED(cfg *Config, s LEDSettings) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.Path, append(out, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(cfg.Path, append(out, '\n'), 0o644); err != nil {
 		return fmt.Errorf("config: write %s: %w", cfg.Path, err)
 	}
-	cfg.LED.LEDSettings = s // keep the live config in sync with the file
 	return nil
 }
 
@@ -335,10 +376,9 @@ func SaveStandby(cfg *Config, s StandbyConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.Path, append(out, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(cfg.Path, append(out, '\n'), 0o644); err != nil {
 		return fmt.Errorf("config: write %s: %w", cfg.Path, err)
 	}
-	cfg.Standby = s // keep the live config in sync with the file
 	return nil
 }
 
@@ -458,6 +498,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PacketDelay <= 0 {
 		c.PacketDelay = 10
+	}
+	if c.PreviewHold <= 0 {
+		c.PreviewHold = 5000 // how long an editor preview holds the screen
 	}
 	if len(c.Sensors.MountPoints) == 0 {
 		c.Sensors.MountPoints = []string{"/"}
@@ -711,7 +754,7 @@ func SaveTheme(path string, t *Theme) error {
 		return fmt.Errorf("theme: encode: %w", err)
 	}
 	raw = append(raw, '\n')
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := writeFileAtomic(path, raw, 0o644); err != nil {
 		return fmt.Errorf("theme: write %s: %w", path, err)
 	}
 	return nil

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"maps"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +16,6 @@ import (
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/render"
 )
-
-// previewHold keeps an editor preview visible on the real panel long enough
-// to be seen before the live loop repaints (spec has no preview concept; the
-// original web UI had the same "apply to screen" action).
-const previewHold = 5 * time.Second
 
 // App owns all subsystems and the panel state machine.
 type App struct {
@@ -51,6 +45,13 @@ type App struct {
 	lastBackoffLog time.Time
 	manualLED      *config.LEDSettings // editor-driven LED set (outranks config)
 	lastLEDTheme   int                 // mode the strip now holds (0 = nothing sent)
+	// LED link resilience: a CH340 replug leaves a dead serial handle
+	// (writes fail -> ledBroken), and a port that only appeared after
+	// startup leaves led == nil; the tick retries OpenAuto at most once
+	// per 15 s (ledRetryAt) and rate-limits the failure log (ledFailLogged).
+	ledBroken     bool
+	ledRetryAt    time.Time
+	ledFailLogged time.Time
 	// Standby (software screen-off): the protocol has no power command, so
 	// the screen is a black full redraw, the LED strip is off and the tick
 	// stops rendering until the schedule window ends or the button flips.
@@ -63,26 +64,33 @@ type App struct {
 // A missing LED port is a soft failure (the panel still works), matching the
 // original led_thread.js tolerance.
 func New(cfg *config.Config) (*App, error) {
-	var tr display.Transport
-	var err error
-	if cfg.Device.Path != "" {
-		tr, err = display.OpenPath(cfg.Device.Path)
-	} else {
-		tr, err = display.OpenHID(uint16(cfg.Device.VID), uint16(cfg.Device.PID), cfg.Device.Interface)
+	// One dial closure serves the first open AND every later reopen: the
+	// panel used to be a hard startup dependency (missing panel -> the
+	// daemon exited), so a replug or a container start racing udev killed
+	// everything. A startup failure is now soft: NewWithReconnect keeps a
+	// display worker redialing in the background (1s..15s backoff).
+	dial := func() (display.Transport, error) {
+		if cfg.Device.Path != "" {
+			return display.OpenPath(cfg.Device.Path)
+		}
+		return display.OpenHID(uint16(cfg.Device.VID), uint16(cfg.Device.PID), cfg.Device.Interface)
 	}
+	tr, err := dial()
 	if err != nil {
-		return nil, err
+		log.Printf("app: panel not open at startup: %v (reopening in the background)", err)
 	}
-	theme, err := config.LoadTheme(cfg.ThemeFile)
-	if err != nil {
-		tr.Close()
-		return nil, err
+	theme, terr := config.LoadTheme(cfg.ThemeFile)
+	if terr != nil {
+		if tr != nil {
+			tr.Close()
+		}
+		return nil, terr
 	}
 	a := &App{
 		cfg:         cfg,
 		registry:    BuildRegistry(cfg),
 		fonts:       render.NewFonts(cfg.Fonts),
-		disp:        display.New(tr, time.Duration(cfg.PacketDelay)*time.Millisecond, time.Duration(cfg.RedrawDelay)*time.Millisecond),
+		disp:        display.NewWithReconnect(tr, dial, time.Duration(cfg.PacketDelay)*time.Millisecond, time.Duration(cfg.RedrawDelay)*time.Millisecond),
 		theme:       theme,
 		forceRedraw: true,
 	}
@@ -149,12 +157,6 @@ func (a *App) Run(ctx context.Context) error {
 		a.disp.Close()
 	}()
 
-	// Build marker for deployment checks ("screen did not change" vs
-	// "an old image is still running"): docker compose logs | grep "pacing v4".
-	// v4 = standby outranks the editor preview («Примерить» no longer
-	// repaints the black standby frame).
-	log.Printf("app: display pacing v4 (paced redraw chunks; standby wins over editor preview)")
-
 	// START_COOL_DOWN in main.js: 1000 ms between opening the HID device
 	// and the first command so the descriptors settle.
 	select {
@@ -165,7 +167,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	a.applyThemeOrientation(ctx)
 	if err := a.disp.SetTime(ctx, time.Now()); err != nil {
-		return fmt.Errorf("app: set time: %w", err)
+		log.Printf("app: set time: %v (panel may be offline; the poll loop keeps retrying)", err)
 	}
 
 	// first full frame (startup sequence: orientation -> time -> redraw).
@@ -178,21 +180,24 @@ func (a *App) Run(ctx context.Context) error {
 		a.standbyOn, a.standbySchedPrev, a.standbyApplied = true, true, true
 		a.mu.Unlock()
 		if err := a.disp.Redraw(ctx, make([]byte, display.FrameBytes)); err != nil {
-			return fmt.Errorf("app: initial standby redraw: %w", err)
+			log.Printf("app: initial standby redraw: %v (the poll loop will retry)", err)
 		}
 		a.turnStandbyLEDOff()
 		log.Printf("app: standby window active at startup: screen kept black until %s", a.cfg.Standby.End)
 		a.markHeartbeatSent()
 		return a.runLoop(ctx)
 	}
+	// A failing first frame is not fatal either: forceRedraw is still set
+	// from New (and the reconnect path may simply still be waiting for the
+	// panel), so the first poll tick repaints.
 	frame, err := a.renderCurrent()
 	if err != nil {
-		return err
+		log.Printf("app: initial render: %v (the poll loop will retry)", err)
+	} else if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
+		log.Printf("app: initial redraw: %v (the poll loop will retry)", err)
+	} else {
+		a.setLastFrame(frame)
 	}
-	if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
-		return fmt.Errorf("app: initial redraw: %w", err)
-	}
-	a.setLastFrame(frame)
 	a.applyScreenLED(a.currentScreen())
 	a.markHeartbeatSent()
 	return a.runLoop(ctx)
@@ -269,6 +274,11 @@ func (a *App) tick(ctx context.Context) error {
 		a.lastWriteFails = fails
 		a.mu.Lock()
 		a.forceRedraw = true
+		// With the reconnect path the dead link also dropped queued jobs,
+		// so a standby black frame that went out before the failure is gone
+		// too: re-arm the standby entry (black frame + LED off) alongside
+		// the repaint latch.
+		a.standbyApplied = false
 		a.mu.Unlock()
 	}
 	a.mu.Lock()
@@ -294,6 +304,18 @@ func (a *App) tick(ctx context.Context) error {
 		a.standbyApplied = true
 	}
 	a.mu.Unlock()
+
+	// LED link resilience: a CH340 replug leaves a dead serial handle (and
+	// a port that only appeared after startup leaves led == nil); retry
+	// OpenAuto on the loop goroutine, rate-limited, and re-push whatever
+	// the panel should show the moment the strip is back.
+	if a.maybeReopenLED() {
+		if standby {
+			a.turnStandbyLEDOff()
+		} else {
+			a.applyScreenLED(a.currentScreen())
+		}
+	}
 
 	// Standby (software screen-off). doc/revrite.md §2 has no power command,
 	// so "off" is one black full frame, the strip dark, and no rotation or
@@ -552,60 +574,6 @@ func (a *App) PauseRotation(on bool) {
 	a.mu.Unlock()
 }
 
-// Standby forces software standby (black screen + strip off) on/off from
-// the editor. Like PauseRotation it only flips the flag: every panel write
-// stays on the Run/tick goroutine, which reacts within cfg.Poll ms. The
-// schedule boundary outranks the button when the window opens or closes.
-func (a *App) Standby(on bool) {
-	a.mu.Lock()
-	if a.standbyOn != on {
-		a.standbyOn = on
-		log.Printf("app: standby %s requested from editor", map[bool]string{true: "on", false: "off"}[on])
-	}
-	a.mu.Unlock()
-}
-
-// StandbyState reports the effective standby state (/api/state feeds the
-// editor checkbox its initial value).
-func (a *App) StandbyState() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.standbyOn
-}
-
-// StandbySchedule returns the configured standby window ("no timer" = both
-// empty), so the editor can refill its schedule controls on load.
-func (a *App) StandbySchedule() config.StandbyConfig {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.cfg.Standby
-}
-
-// SetStandbySchedule changes the standby timer at runtime: it validates,
-// rewrites config.json (same persistence the manual LED apply uses via
-// SaveLED) and swaps the window into the live config. The next poll tick
-// sees the schedule edge and applies it: a window covering "now" blacks
-// the screen right away; clearing both times removes the timer entirely,
-// after which only the button switches the screen off and nothing - no
-// boundary, no window - ever switches it back on.
-func (a *App) SetStandbySchedule(sc config.StandbyConfig) error {
-	if err := sc.Validate(); err != nil {
-		return err
-	}
-	if err := config.SaveStandby(a.cfg, sc); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	a.cfg.Standby = sc
-	a.mu.Unlock()
-	if sc.Enabled() {
-		log.Printf("app: standby timer set: %s-%s", sc.Start, sc.End)
-	} else {
-		log.Printf("app: standby timer removed: screen off is manual only")
-	}
-	return nil
-}
-
 func (a *App) firstEnabledIndex() int {
 	for i, sc := range a.theme.Screens {
 		if sc.IsEnabled() {
@@ -637,8 +605,12 @@ func (a *App) renderCurrent() (*render.Frame, error) {
 }
 
 func (a *App) refresh() {
+	// SampleAll walks sysfs/stat (milliseconds): run it OUTSIDE a.mu so the
+	// editor handlers are not stalled behind every poll tick; only the map
+	// swap needs the lock.
+	rd := a.registry.SampleAll()
 	a.mu.Lock()
-	a.readings = a.registry.SampleAll()
+	a.readings = rd
 	a.mu.Unlock()
 }
 
@@ -659,177 +631,11 @@ func (a *App) applyThemeOrientation(ctx context.Context) {
 	}
 }
 
-// ---- LED ----
-
-func (a *App) applyScreenLED(sc *config.Screen) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.applyScreenLEDLocked(sc)
-}
-
-// applyScreenLEDLocked merges the per-screen led_config over the global LED
-// settings field by field (zero = inherit). The original overwrote all
-// three fields wholesale on screen change (main.js:296-298, theme||4) and
-// only set update_led then - there is no periodic re-apply loop: a frame
-// goes out at startup, on screen changes INTO screens that HAVE led_config,
-// and on editor applies. Shipped themes carry no per-screen led_config at
-// all, so in practice the global/manual side drives the strip; inheriting
-// missing fields from the global settings is the documented deviation.
-// The global side of that merge starts from the editor's manual settings
-// when present (manualLED): without that, an "off" pushed from the editor
-// was undone by the very next screen rotation, which re-applied the config
-// theme. Callers hold a.mu (rotateScreen) or run single-threaded before
-// the loop.
-func (a *App) applyScreenLEDLocked(sc *config.Screen) {
-	if a.led == nil || sc == nil {
-		return
-	}
-	s := a.cfg.LED.LEDSettings
-	if a.manualLED != nil {
-		s = *a.manualLED
-	}
-	if sc.LED != nil {
-		if sc.LED.Theme != 0 {
-			s.Theme = sc.LED.Theme
-		}
-		if sc.LED.Intensity != 0 {
-			s.Intensity = sc.LED.Intensity
-		}
-		if sc.LED.Speed != 0 {
-			s.Speed = sc.LED.Speed
-		}
-	}
-	switch s.Theme {
-	case led.ThemeIgnore: // led_thread.js case 6: no packet at all
-		log.Printf("app: led theme 6 (ignore): strip left as-is")
-	case led.ThemeOff:
-		if err := a.led.Off(); err != nil {
-			log.Printf("app: led off: %v", err)
-		} else {
-			log.Printf("app: led: off frame % X -> %s", led.OffPacket(), a.led.Name)
-			a.lastLEDTheme = s.Theme
-		}
-	default:
-		if err := a.led.Set(s.Theme, s.Intensity, s.Speed); err != nil {
-			log.Printf("app: led set: %v", err)
-		} else {
-			log.Printf("app: led: frame % X -> %s", led.Packet(s.Theme, s.Intensity, s.Speed), a.led.Name)
-			a.lastLEDTheme = s.Theme
-		}
-	}
-}
-
-// turnStandbyLEDOff darkens the strip for the standby window and records
-// ThemeOff as the mode the CH340 now holds, so the standby exit
-// (applyScreenLED) and shutdownLED see what is out there. Port writes go
-// under a.mu like every other LED call.
-func (a *App) turnStandbyLEDOff() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.led == nil {
-		return
-	}
-	if err := a.led.Off(); err != nil {
-		log.Printf("app: standby led off: %v", err)
-		return
-	}
-	a.lastLEDTheme = led.ThemeOff
-	log.Printf("app: standby led: off frame % X -> %s", led.OffPacket(), a.led.Name)
-}
-
-// ApplyLEDManual pushes explicit strip settings (editor "apply LED" action).
-// Config-scale intensity/speed; theme 6 sends nothing (original ignore).
-// The settings also become the live global for every later screen change,
-// so an editor "off" is no longer undone by the next rotation. The HTTP
-// handler persists them with PersistLED before calling this - the original
-// set_led_strip rewrote config.json the same way (api.js:309-316) - so the
-// choice survives a restart too.
-func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
-	if a.led == nil {
-		return fmt.Errorf("app: led device not open")
-	}
-	if settings.Theme < led.ThemeRainbow || settings.Theme > led.ThemeIgnore {
-		return fmt.Errorf("app: led: theme must be 1..6, got %d", settings.Theme)
-	}
-	// Port writes run under a.mu as well: the rotation path
-	// (applyScreenLEDLocked) drives the same CH340 from the loop
-	// goroutine, and interleaved FA..checksum frames latch garbage.
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	switch settings.Theme {
-	case led.ThemeIgnore:
-		log.Printf("app: led theme 6 (ignore): no packet sent")
-	case led.ThemeOff:
-		if err := a.led.Off(); err != nil {
-			return err
-		}
-	default:
-		if err := a.led.Set(settings.Theme, settings.Intensity, settings.Speed); err != nil {
-			return err
-		}
-	}
-	if settings.Theme != led.ThemeIgnore {
-		a.lastLEDTheme = settings.Theme
-		log.Printf("app: led: manual frame % X -> %s", manualFrame(settings), a.led.Name)
-	}
-	m := settings
-	a.manualLED = &m
-	return nil
-}
-
-// shutdownLED turns the strip off when the daemon exits while it had been
-// driving it: the CH340 controller latches its last mode, so a stopped (or
-// afterwards led.enabled=false) daemon would otherwise leave the strip
-// burning. When the strip was never touched, or left alone via theme 6
-// ("ignore"), nothing is sent.
-func (a *App) shutdownLED() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	last := a.lastLEDTheme
-	if a.led == nil || last == 0 || last == led.ThemeIgnore {
-		return
-	}
-	if err := a.led.Off(); err != nil {
-		log.Printf("app: led off on shutdown: %v", err)
-		return
-	}
-	log.Printf("app: led off sent on shutdown to %s", a.led.Name)
-}
-
-// portsSummary renders every serial port this process can see for the
-// startup log ("ttyUSB0[067b:2303] ttyUSB1[1a86:7523] <- CH340"). One
-// grep-able line that answers "is the CH340 even visible here?" - wrong
-// ttyUSB indices and missing docker device mappings both fail exactly
-// this question.
-func portsSummary() string {
-	ports, err := led.ListPorts()
-	if err != nil {
-		return "enumeration failed: " + err.Error()
-	}
-	if len(ports) == 0 {
-		return "none"
-	}
-	parts := make([]string, 0, len(ports))
-	for _, p := range ports {
-		part := fmt.Sprintf("%s[%s:%s]", p.Name, p.VID, p.PID)
-		if led.IsCH340(p) {
-			part += " <- CH340"
-		}
-		parts = append(parts, part)
-	}
-	return strings.Join(parts, " ")
-}
-
-// manualFrame is the exact bytes ApplyLEDManual just pushed; logging it
-// makes a "still lit" report decidable from the daemon log alone.
-func manualFrame(s config.LEDSettings) []byte {
-	if s.Theme == led.ThemeOff {
-		return led.OffPacket()
-	}
-	return led.Packet(s.Theme, s.Intensity, s.Speed)
-}
-
 // ---- editor / admin hooks ----
+//
+// The LED strip side of the App (per-screen merge, manual apply, standby
+// darkening, replug recovery) lives in led.go; the standby state machine
+// and its editor hooks live in standby.go.
 
 // DeviceRect maps a logical theme rect to the physical 320x170 buffer space
 // (the same math as translate_rect in the original main.js: portrait user
@@ -913,11 +719,11 @@ func (a *App) warnUnknownSensors(t *config.Theme) {
 	}
 }
 
-// Config returns the daemon configuration. Everything but theme_file is
-// fixed at load time and safe to read through this pointer; the live
-// theme_file is guarded by ThemeFile/SetThemeFile (the editor's
-// /api/theme used to write cfg.ThemeFile unlocked while the poll loop
-// read it).
+// Config returns the daemon configuration. Most fields are fixed at load
+// time and safe to read through this pointer; the mutable ones
+// (theme_file, Standby, LED settings) change only under a.mu — read those
+// through the locked accessors (ThemeFile, StandbySchedule, LEDConfig)
+// instead of this pointer.
 func (a *App) Config() *config.Config { return a.cfg }
 
 // ThemeFile is the live theme file path (locked).
@@ -951,10 +757,18 @@ func (a *App) ManualLED() (config.LEDSettings, bool) {
 // same on every set_led_strip (s1panel/api.js:309-316). Without it a manual
 // "off" lived only in memory and the next start re-applied the config's
 // theme and re-lit the strip, which is what made "выкл" look ignored.
+//
+// SaveLED is file-only (it never mutates cfg), so the live global that the
+// rotation merge reads (cfg.LED.LEDSettings) must be updated here, under
+// a.mu like every other live-cfg write.
 func (a *App) PersistLED(s config.LEDSettings) error {
+	if err := config.SaveLED(a.cfg, s); err != nil {
+		return err
+	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return config.SaveLED(a.cfg, s)
+	a.cfg.LED.LEDSettings = s
+	a.mu.Unlock()
+	return nil
 }
 
 // CurrentScreenIndex is the screen currently shown (editor highlight).
@@ -985,9 +799,20 @@ func (a *App) PreviewFrame(t *config.Theme, screenIdx int) (*render.Frame, error
 	return render.Render(&t.Screens[screenIdx], t, display.FrameWidth, display.FrameHeight, portrait, a.LatestReadings(), a.fonts)
 }
 
+// previewHoldDuration is how long a «Примерить» draft holds the screen
+// before the live loop repaints it (config.json preview_hold, ms; a
+// missing/zero value keeps the original 5 s). cfg is fixed at load time,
+// so reading it unlocked is safe.
+func (a *App) previewHoldDuration() time.Duration {
+	if a.cfg.PreviewHold > 0 {
+		return time.Duration(a.cfg.PreviewHold) * time.Millisecond
+	}
+	return 5 * time.Second
+}
+
 // PreviewOnScreen renders the draft and pushes it to the REAL panel via a
 // full redraw (the editor "Примерить" button), then holds the live loop
-// quiet for previewHold so the draft stays visible.
+// quiet for preview_hold ms so the draft stays visible.
 func (a *App) PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx int) (*render.Frame, error) {
 	frame, err := a.PreviewFrame(t, screenIdx)
 	if err != nil {
@@ -1007,12 +832,18 @@ func (a *App) PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx in
 		log.Printf("app: preview not pushed: standby is on, the screen stays black (turn standby off to preview on hardware)")
 		return frame, nil
 	}
+	// Backlog guard (same symptom as the standby entry): partial tiles
+	// queued behind the click would paint over the preview before its 27
+	// chunks land.
+	if n := a.disp.DropPending(); n > 0 {
+		log.Printf("app: dropping %d queued update job(s) before preview redraw", n)
+	}
 	if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
 		return nil, err
 	}
 	a.setLastFrame(frame)
 	a.mu.Lock()
-	a.previewUntil = time.Now().Add(previewHold)
+	a.previewUntil = time.Now().Add(a.previewHoldDuration())
 	a.forceRedraw = true
 	a.previewLED = a.led != nil // tick restores the live screen's LED on expiry
 	a.mu.Unlock()

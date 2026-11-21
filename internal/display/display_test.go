@@ -391,3 +391,147 @@ func TestPostAfterCloseFails(t *testing.T) {
 		t.Fatalf("transport closed %d times, want 1", tr.closed)
 	}
 }
+
+// ---- NewWithReconnect: USB unplug/replug resilience ----
+
+// A write failure on a reconnect-enabled Display closes the dead transport
+// exactly once and the next job goes through a freshly dialed one.
+func TestReconnectReopensTransportAfterWriteFailure(t *testing.T) {
+	dead := &fakeTransport{failFrom: 0}
+	fresh := newFakeTransport()
+	dial := func() (Transport, error) { return fresh, nil }
+	d := NewWithReconnect(dead, dial, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	if err := d.SetOrientation(ctx, OrientationLandscape); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetTime(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitForWrites(t, fresh, 1) // the second job went through the redialed transport
+	deadline := time.Now().Add(time.Second)
+	for dead.closed < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the failed transport was never closed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if dead.closed != 1 {
+		t.Fatalf("dead transport closed %d times, want 1 (killTransport + Close must not double-close)", dead.closed)
+	}
+	if fresh.closed != 1 {
+		t.Fatalf("live transport closed %d times by Close, want 1", fresh.closed)
+	}
+}
+
+// Panel not plugged in at daemon start: tr == nil, the first job triggers
+// the redial loop; a failing dial waits the 1 s backoff floor before the
+// retry.
+func TestReconnectFromOfflineStartWithFailingDial(t *testing.T) {
+	fresh := newFakeTransport()
+	var mu sync.Mutex
+	attempts := 0
+	dial := func() (Transport, error) {
+		mu.Lock()
+		attempts++
+		first := attempts == 1
+		mu.Unlock()
+		if first {
+			return nil, errors.New("panel not plugged in yet")
+		}
+		return fresh, nil
+	}
+	d := NewWithReconnect(nil, dial, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	start := time.Now()
+	if err := d.Heartbeat(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitForWrites(t, fresh, 1)
+	if attempts < 2 {
+		t.Fatalf("dial attempts = %d, want a retry after the first failure", attempts)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("retry after failed dial took %v; the 1 s backoff floor was skipped", elapsed)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.closed != 1 {
+		t.Fatalf("transport closed %d times by Close, want 1", fresh.closed)
+	}
+}
+
+// Jobs queued while the link was dead: the current job still goes out on
+// the fresh transport, but stale partial tiles queued behind it are dropped
+// (the panel never saw their predecessors); commands survive.
+func TestReconnectDropsStaleQueuedUpdates(t *testing.T) {
+	fresh := newFakeTransport()
+	gate := make(chan struct{})
+	dial := func() (Transport, error) {
+		<-gate // park the worker inside reconnect until the test releases it
+		return fresh, nil
+	}
+	d := NewWithReconnect(nil, dial, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	if err := d.Update(ctx, Rect{X: 0, Y: 0, Width: 10, Height: 10}, make([]byte, 200)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond) // worker is parked in the dial call now
+	if err := d.Update(ctx, Rect{X: 20, Y: 0, Width: 10, Height: 10}, make([]byte, 200)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Heartbeat(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	close(gate) // dial succeeds: DropPending must drain the stale tile
+
+	waitForWrites(t, fresh, 2)
+	time.Sleep(50 * time.Millisecond) // no third write may sneak in
+	if n := fresh.count(); n != 2 {
+		t.Fatalf("fresh transport got %d writes, want 2 (stale queued update must be dropped)", n)
+	}
+	if p := fresh.at(0); p[1] != CmdUpdate {
+		t.Fatalf("current job missing from the fresh transport: %02X", p[1])
+	}
+	if p := fresh.at(1); p[1] != CmdConfig || p[2] != SubHeartbeat {
+		t.Fatalf("heartbeat missing or misordered after reconnect: %02X %02X", p[1], p[2])
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// After killTransport closed the failed transport, Close must not touch it
+// again (undefined for a closed HID descriptor).
+func TestCloseAfterLinkLossDoesNotDoubleClose(t *testing.T) {
+	dead := &fakeTransport{failFrom: 0}
+	dial := func() (Transport, error) { return nil, errors.New("still unplugged") }
+	d := NewWithReconnect(dead, dial, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	if err := d.SetOrientation(ctx, OrientationLandscape); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // worker processed the failure, armed redial
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if dead.closed != 1 {
+		t.Fatalf("transport closed %d times, want 1", dead.closed)
+	}
+}

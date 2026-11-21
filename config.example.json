@@ -23,6 +23,7 @@
   "listen": "0.0.0.0:8686",
   "debug_update": false,
   "poll": 1000,
+  "preview_hold": 5000,
   "heartbeat": 60000,
   "redraw_delay": 1600,
   "packet_delay": 10,

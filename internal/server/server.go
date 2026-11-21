@@ -44,6 +44,7 @@ type Panel interface {
 	ApplyLEDManual(s config.LEDSettings) error
 	ManualLED() (config.LEDSettings, bool)
 	PersistLED(s config.LEDSettings) error
+	LEDConfig() config.LEDConfig
 	NextScreen()
 	ShowScreen(id int) bool
 	PauseRotation(on bool)
@@ -223,7 +224,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 // form from config defaults (5/3/3) after a page refresh, and the next
 // "apply" re-lights a strip the user had just set to "off".
 func (s *Server) effectiveLED() config.LEDConfig {
-	led := s.app.Config().LED
+	// LEDConfig is the locked copy: PersistLED swaps cfg.LED.LEDSettings
+	// under a.mu on the daemon side, and reading cfg.LED through Config()
+	// unlocked was a data race.
+	led := s.app.LEDConfig()
 	if m, ok := s.app.ManualLED(); ok {
 		led.LEDSettings = m
 	}

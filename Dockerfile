@@ -69,5 +69,13 @@ WORKDIR /etc/s1panel
 VOLUME /etc/s1panel
 EXPOSE 8686
 
+# Liveness = the editor socket accepts a connection: the Go http server is
+# up iff the daemon is. curl/wget are not in slim, so probe with bash's
+# /dev/tcp (bash is an essential Debian package). Note: if you run with
+# listening disabled (-admin "" and empty "listen"), this check fails by
+# design — drop the HEALTHCHECK line in that deployment.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8686"]
+
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["-config", "/etc/s1panel/config.json"]
