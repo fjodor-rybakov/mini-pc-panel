@@ -4,6 +4,8 @@ package led
 
 import (
 	"fmt"
+	"io"
+	"time"
 
 	"go.bug.st/serial"
 )
@@ -79,6 +81,35 @@ func clamp(v int) int {
 	return v
 }
 
+// byteDelay mirrors DELAY=5 in led_device.js: the original sent the frame
+// one byte at a time with a 5 ms pause between writes (port_byte_write +
+// setTimeout), i.e. ~4 ms of idle line between bytes at 10000 baud. The
+// HT32-side LED parser needs those idle gaps; a back-to-back burst is
+// dropped and the strip keeps whatever mode it already had - including
+// staying lit after "off".
+const byteDelay = 5 * time.Millisecond
+
+// frameSink is the part of serial.Port used to push one frame; tests
+// substitute a fake to observe the pacing without hardware.
+type frameSink interface {
+	io.Writer
+	Drain() error
+}
+
+// writeFrame reproduces port_byte_write(): one Write per byte, byteDelay
+// apart, then Drain so the last byte has physically left before Close.
+func writeFrame(s frameSink, frame []byte, sleep func(time.Duration)) error {
+	for i, b := range frame {
+		if i > 0 {
+			sleep(byteDelay)
+		}
+		if _, err := s.Write([]byte{b}); err != nil {
+			return fmt.Errorf("led: write to port: %w", err)
+		}
+	}
+	return s.Drain()
+}
+
 // Device writes LED commands to the CH340 serial port.
 type Device struct {
 	port serial.Port
@@ -98,9 +129,7 @@ func Open(port string) (*Device, error) {
 
 // Set applies theme/intensity/speed (config scale; the fix_value() inversion
 // happens inside, like the original set_* functions). Theme 6 is the
-// original "ignore" case: no packet is written. The original wrote one
-// byte every 5 ms; at 10000 baud a 5-byte frame takes ~5 ms on the wire
-// anyway, and Drain() blocks until it is fully transmitted.
+// original "ignore" case: no packet is written.
 func (d *Device) Set(theme, intensity, speed int) error {
 	if theme == ThemeIgnore {
 		return nil // original case 6 never reaches the port at all
@@ -108,10 +137,7 @@ func (d *Device) Set(theme, intensity, speed int) error {
 	if d == nil || d.port == nil {
 		return nil
 	}
-	if _, err := d.port.Write(Packet(theme, intensity, speed)); err != nil {
-		return fmt.Errorf("led: write to port: %w", err)
-	}
-	return d.port.Drain()
+	return writeFrame(d.port, Packet(theme, intensity, speed), time.Sleep)
 }
 
 // Off turns the strip off with the hard-coded set_off() pattern.
@@ -119,10 +145,7 @@ func (d *Device) Off() error {
 	if d == nil || d.port == nil {
 		return nil
 	}
-	if _, err := d.port.Write(OffPacket()); err != nil {
-		return fmt.Errorf("led: write to port: %w", err)
-	}
-	return d.port.Drain()
+	return writeFrame(d.port, OffPacket(), time.Sleep)
 }
 
 // Close releases the serial port.

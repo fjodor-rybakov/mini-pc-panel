@@ -2,7 +2,9 @@ package led
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+	"time"
 )
 
 // set_* in led_device.js runs intensity/speed through fix_value() before
@@ -78,5 +80,82 @@ func TestNilDeviceSafe(t *testing.T) {
 	}
 	if err := d.Close(); err != nil {
 		t.Fatalf("nil device Close: %v", err)
+	}
+}
+
+// fakeSink records every Write payload so the test can see the frame was
+// delivered one byte at a time (port_byte_write in led_device.js), not as
+// a single burst the HT32 LED parser drops.
+type fakeSink struct {
+	writes  [][]byte
+	drained int
+	writeAt []time.Time
+	err     error
+}
+
+func (f *fakeSink) Write(p []byte) (int, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.writes = append(f.writes, append([]byte(nil), p...))
+	f.writeAt = append(f.writeAt, time.Now())
+	return len(p), nil
+}
+
+func (f *fakeSink) Drain() error { f.drained++; return nil }
+
+func TestWriteFramePacesOneBytePerWrite(t *testing.T) {
+	var sleeps []time.Duration
+	sink := &fakeSink{}
+	frame := OffPacket()
+	if err := writeFrame(sink, frame, func(d time.Duration) { sleeps = append(sleeps, d) }); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if len(sink.writes) != len(frame) {
+		t.Fatalf("got %d writes, want %d (one per byte)", len(sink.writes), len(frame))
+	}
+	var got []byte
+	for _, w := range sink.writes {
+		if len(w) != 1 {
+			t.Fatalf("write of %d bytes, want 1", len(w))
+		}
+		got = append(got, w[0])
+	}
+	if !bytes.Equal(got, frame) {
+		t.Errorf("bytes on the wire = % X, want % X", got, frame)
+	}
+	if len(sleeps) != len(frame)-1 {
+		t.Fatalf("got %d pauses, want %d", len(sleeps), len(frame)-1)
+	}
+	for _, d := range sleeps {
+		if d != byteDelay {
+			t.Errorf("pause = %v, want %v", d, byteDelay)
+		}
+	}
+	if sink.drained != 1 {
+		t.Errorf("Drain called %d times, want 1", sink.drained)
+	}
+}
+
+// Real wall-clock check: with time.Sleep the last byte must leave at least
+// (len-1)*byteDelay after the first, i.e. the line idles between bytes like
+// the original 5 ms setTimeout loop does.
+func TestWriteFrameRealTiming(t *testing.T) {
+	sink := &fakeSink{}
+	if err := writeFrame(sink, OffPacket(), time.Sleep); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	want := time.Duration(len(OffPacket())-1) * byteDelay
+	if el := sink.writeAt[len(sink.writeAt)-1].Sub(sink.writeAt[0]); el < want {
+		t.Errorf("last byte after %v, want >= %v", el, want)
+	}
+}
+
+func TestWriteFramePropagatesErrors(t *testing.T) {
+	sink := &fakeSink{err: errors.New("boom")}
+	if err := writeFrame(sink, OffPacket(), func(time.Duration) {}); err == nil {
+		t.Fatal("write error must propagate")
+	} else if !errors.Is(err, sink.err) {
+		t.Errorf("error %v does not wrap the port error", err)
 	}
 }

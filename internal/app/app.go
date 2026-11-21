@@ -555,7 +555,9 @@ func (a *App) shutdownLED() {
 	}
 	if err := a.led.Off(); err != nil {
 		log.Printf("app: led off on shutdown: %v", err)
+		return
 	}
+	log.Printf("app: led off sent on shutdown")
 }
 
 // ---- editor / admin hooks ----
