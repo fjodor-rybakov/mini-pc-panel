@@ -98,6 +98,14 @@ func (d *Display) worker(ctx context.Context) {
 
 // process runs on the worker goroutine only.
 func (d *Display) process(j *job) {
+	// The 10 ms pause (spec §5.1) is the author's rule for the partial
+	// update STREAM ("sleep a little between updates, otherwise you will
+	// get a send error"). Upstream lcd_device.js feeds redraw chunks
+	// back-to-back - redraw_next chains one write to the next with no
+	// timer, pacing instead by the device's own NAK flow control. Sleeping
+	// between the 27 redraw chunks made every full repaint take
+	// 27*(delay+write) for no benefit.
+	burst := j.label == "redraw"
 	for _, p := range j.packets {
 		if err := d.tr.Write(p); err != nil {
 			// The original lcd_thread.js logged and carried on. We log the
@@ -111,7 +119,9 @@ func (d *Display) process(j *job) {
 			d.mu.Unlock()
 			return
 		}
-		time.Sleep(d.delay) // spec §5.1: pause between packets
+		if !burst {
+			time.Sleep(d.delay) // spec §5.1: pause between update packets
+		}
 	}
 }
 

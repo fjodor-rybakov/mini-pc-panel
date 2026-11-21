@@ -213,6 +213,41 @@ func TestSplitRectWideBarFitsUint8Sides(t *testing.T) {
 	}
 }
 
+// Banding regression round 2: SplitRect must minimise the packet count, not
+// just be valid. The old fixed 45 px grid sent the 300x6 bar as 7 tiles and
+// a 100x100 block as 9; every tile costs a write plus the 10 ms pause and
+// the panel repaints them in arrival order, so tile count is exactly how far
+// one half of a refresh lags behind the other (user: one part updates fast,
+// the second lags ~0.5 s).
+func TestSplitRectPacksFewestPackets(t *testing.T) {
+	if n := len(SplitRect(Rect{X: 10, Y: 162, Width: 300, Height: 6})); n != 2 {
+		t.Fatalf("300x6 fits in 2 packets (255x6 + 45x6), got %d", n)
+	}
+	if n := len(SplitRect(Rect{X: 0, Y: 0, Width: 100, Height: 100})); n != 5 {
+		t.Fatalf("100x100 fits in 5 strips of 100x20 (2000 px each), got %d", n)
+	}
+	for _, r := range []Rect{
+		{X: 5, Y: 7, Width: 300, Height: 160}, // near-full-screen widget
+		{X: 0, Y: 0, Width: 60, Height: 170},  // tall narrow column
+		{X: 0, Y: 0, Width: 319, Height: 3},   // pathological thin strip
+	} {
+		subs := SplitRect(r)
+		total := 0
+		for _, s := range subs {
+			if s.Width > 255 || s.Height > 255 || s.Width*s.Height > MaxUpdatePixels {
+				t.Fatalf("piece %dx%d of %+v is not packet-sized", s.Width, s.Height, r)
+			}
+			if s.X < r.X || s.Y < r.Y || s.X+s.Width > r.X+r.Width || s.Y+s.Height > r.Y+r.Height {
+				t.Fatalf("piece %+v escapes parent %+v", s, r)
+			}
+			total += s.Width * s.Height
+		}
+		if total != r.Width*r.Height {
+			t.Fatalf("coverage of %+v: %d px, want %d", r, total, r.Width*r.Height)
+		}
+	}
+}
+
 // Oversized pixel input must not spill past the 4096-byte payload, and a
 // negative side (caller bug) must not slice the packet buffer backwards.
 func TestUpdatePacketPixelCaps(t *testing.T) {

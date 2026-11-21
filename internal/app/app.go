@@ -143,6 +143,10 @@ func (a *App) Run(ctx context.Context) error {
 		a.disp.Close()
 	}()
 
+	// Build marker for deployment checks ("screen did not change" vs
+	// "an old image is still running"): docker compose logs | grep "pacing v2".
+	log.Printf("app: display pacing v2 (tile-level diff, min-packet split, burst redraw chunks)")
+
 	// START_COOL_DOWN in main.js: 1000 ms between opening the HID device
 	// and the first command so the descriptors settle.
 	select {
@@ -310,9 +314,17 @@ func (a *App) tick(ctx context.Context) error {
 		return nil
 	}
 
-	// partial refresh: compare each widget's device-space region
+	// Partial refresh: diff at TILE level, not per widget. A clock whose
+	// seconds digit ticks usually changes one or two SplitRect tiles; the
+	// widget-level check re-sent the whole clock region every second.
+	// Every skipped tile is a write + 10 ms pause the link does not spend,
+	// and the "one half updates, the other lags ~0.5 s" symptom is exactly
+	// the panel painting too many tiles in sequence. All changed tiles of
+	// the whole tick go as ONE Updates job, so they stay contiguous on the
+	// wire (no heartbeat or next-tick pieces interleaving mid-frame).
 	sc := a.currentScreen()
 	_, _, portrait := a.Theme().OrientationSize()
+	var tiles []display.Rect
 	for _, w := range sc.Widgets {
 		dr := clampToFrame(DeviceRect(w.Rect, portrait), frame.Width, frame.Height)
 		if dr.Width <= 0 || dr.Height <= 0 {
@@ -321,22 +333,41 @@ func (a *App) tick(ctx context.Context) error {
 		if last.SameRegion(frame, dr.X, dr.Y, dr.Width, dr.Height) {
 			continue
 		}
-		// One job per widget: its SplitRect pieces stay contiguous on the
-		// wire with no heartbeat or other widget's pieces interleaving
-		// between them (a half-painted region interrupted mid-way is what
-		// reads as a torn band).
-		pieces := display.SplitRect(display.Rect{X: dr.X, Y: dr.Y, Width: dr.Width, Height: dr.Height})
-		if err := a.disp.Updates(ctx, pieces, func(r display.Rect) []byte {
-			return frame.Region(r.X, r.Y, r.Width, r.Height)
-		}); err != nil {
-			// Earlier jobs may already be on the panel: the screen is now a
-			// mix of old and new frames. Don't adopt this frame as the
-			// baseline - resync with a full redraw next tick.
-			a.mu.Lock()
-			a.forceRedraw = true
-			a.mu.Unlock()
+		for _, sub := range display.SplitRect(display.Rect{X: dr.X, Y: dr.Y, Width: dr.Width, Height: dr.Height}) {
+			if last.SameRegion(frame, sub.X, sub.Y, sub.Width, sub.Height) {
+				continue
+			}
+			tiles = append(tiles, sub)
+		}
+	}
+	if len(tiles) == 0 {
+		a.setLastFrame(frame)
+		return nil
+	}
+	// A full redraw is ChunkCount burst packets (no 10 ms pause between
+	// chunks) - fewer packets and one coherent image once most of the
+	// screen moved anyway. Streaming that many tiles band by band is what
+	// reads as lagging strips, so switch to the redraw instead.
+	if len(tiles) >= display.ChunkCount {
+		if n := a.disp.DropPending(); n > 0 {
+			log.Printf("app: dropping %d stale queued update job(s) before full redraw", n)
+		}
+		if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
 			return err
 		}
+		a.setLastFrame(frame)
+		return nil
+	}
+	if err := a.disp.Updates(ctx, tiles, func(r display.Rect) []byte {
+		return frame.Region(r.X, r.Y, r.Width, r.Height)
+	}); err != nil {
+		// Earlier jobs may already be on the panel: the screen is now a
+		// mix of old and new frames. Don't adopt this frame as the
+		// baseline - resync with a full redraw next tick.
+		a.mu.Lock()
+		a.forceRedraw = true
+		a.mu.Unlock()
+		return err
 	}
 	a.setLastFrame(frame)
 	return nil

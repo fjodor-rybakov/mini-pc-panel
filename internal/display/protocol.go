@@ -179,9 +179,14 @@ type Rect struct {
 	Height int
 }
 
-// SplitRect chops a device rect into grid pieces small enough for one update
-// packet each (width*height*2 <= 4096 bytes), mirroring calc_update_region of
-// the original main.js: sides are bounded by ~sqrt(MaxUpdatePixels) = 45 px.
+// SplitRect chops a device rect into pieces small enough for one update
+// packet each (uint8 header sides, width*height <= MaxUpdatePixels), then
+// keeps the row-band grid with the FEWEST packets. Every extra packet costs
+// the link a write plus the 10 ms inter-packet pause, and the panel paints
+// tiles as they arrive, so packet count is what makes half the screen
+// visibly lag behind the other. The original main.js calc_update_region
+// fixed the grid at ~sqrt(MaxUpdatePixels) = 45 px sides, which sends a
+// 300x6 bar as 7 tiles where 2 (255x6 + 45x6) suffice.
 func SplitRect(r Rect) []Rect {
 	if r.Width <= 0 || r.Height <= 0 {
 		return nil
@@ -192,11 +197,19 @@ func SplitRect(r Rect) []Rect {
 	if r.Width*r.Height <= MaxUpdatePixels && r.Width <= 255 && r.Height <= 255 {
 		return []Rect{r}
 	}
-	const side = 45
-	cols := ceilDiv(r.Width, side)
-	rows := ceilDiv(r.Height, side)
-	cw := ceilDiv(r.Width, cols)
-	ch := ceilDiv(r.Height, rows)
+	bestRows, bestCols, bestCount := 0, 0, 0
+	for rows := max(1, ceilDiv(r.Height, 255)); rows <= r.Height; rows++ {
+		h := ceilDiv(r.Height, rows)
+		w := min(255, MaxUpdatePixels/h)
+		cols := ceilDiv(r.Width, w)
+		if n := rows * cols; bestCount == 0 || n < bestCount {
+			// ceilDiv(W, cols) <= w follows from cols >= W/w, so every
+			// generated piece stays within the uint8 and payload bounds.
+			bestRows, bestCols, bestCount = rows, cols, n
+		}
+	}
+	cw := ceilDiv(r.Width, bestCols)
+	ch := ceilDiv(r.Height, bestRows)
 	var out []Rect
 	for y := 0; y < r.Height; y += ch {
 		hh := min(ch, r.Height-y)

@@ -130,6 +130,28 @@ func TestRedrawDelayPausesNextJob(t *testing.T) {
 	d.Close()
 }
 
+// Upstream lcd_device.js redraw_next chains the 27 chunk writes with no
+// timer (the device's NAK flow control paces them); the 10 ms pause is the
+// partial-update rule. Even with packet_delay 50 ms the chunks must burst:
+// if per-chunk sleeps crept back in, this would take at least 27*50 ms.
+func TestRedrawChunksBurstWithoutDelay(t *testing.T) {
+	tr := newFakeTransport()
+	d := New(tr, 50*time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	if err := d.Redraw(ctx, make([]byte, FrameBytes)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	waitForWrites(t, tr, ChunkCount)
+	if elapsed := time.Since(start); elapsed > 600*time.Millisecond {
+		t.Fatalf("redraw chunks took %v; per-chunk packet_delay crept back in", elapsed)
+	}
+	d.Close()
+}
+
 func TestDisplayInputValidation(t *testing.T) {
 	tr := newFakeTransport()
 	d := New(tr, time.Millisecond, 20*time.Millisecond)
