@@ -1,7 +1,7 @@
 GO ?= go
 BIN := bin/s1panel
 
-.PHONY: all build build-libusb test vet fmt cover clean
+.PHONY: all build build-libusb ledctl test vet fmt cover clean
 
 all: build
 
@@ -14,6 +14,10 @@ build:
 # kernel hidraw rejects the 4105-byte writes); the Docker build uses this.
 build-libusb:
 	CGO_ENABLED=1 $(GO) build -tags libusb -o bin/s1panel-libusb ./cmd/s1panel
+
+# Hardware triage: one LED frame straight to the CH340 (no cgo, no config).
+ledctl:
+	CGO_ENABLED=0 $(GO) build -o bin/ledctl ./cmd/ledctl
 
 test:
 	$(GO) test ./...

@@ -13,6 +13,7 @@ Go-переписывание (всё удалённое — в истории g
 ```
 ./ (корень репозитория)
 ├── cmd/s1panel/main.go      демон: флаги, сигнал SIGINT/SIGTERM, запуск цикла и админки
+├── cmd/ledctl/main.go       диагностика ленты: один LED-кадр прямо в CH340 (make ledctl)
 ├── internal/config/         config.json + тема экранов (валидация, дефолты, сохранение)
 ├── internal/display/        протокол HID (пакеты) + очередь/один воркер (10 мс пауза)
 ├── internal/led/            CH340: пакет FA|theme|intensity|speed|checksum
@@ -35,6 +36,7 @@ Go-переписывание (всё удалённое — в истории g
 ```sh
 make build         # backend hidraw, bin/s1panel
 make build-libusb  # backend libusb (-tags libusb), bin/s1panel-libusb
+make ledctl        # bin/ledctl — диагностика ленты (один кадр прямо в порт)
 make test vet fmt  # тесты, vet, gofmt
 ```
 
@@ -134,6 +136,40 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Диагностика ленты: ledctl
+
+Если лента не слушается демона, `ledctl` шлёт один кадр прямо в порт тем же
+кодом `internal/led`, что и демон (побайтовая пауза 5 мс), минуя конфиг,
+редактор и цикл экранов — это делит проблему на «демон ничего не шлёт» и
+«лента не реагирует»:
+
+```sh
+make ledctl
+./bin/ledctl list                 # перечислить порты; CH340 = VID=1a86 PID=7523
+./bin/ledctl off                  # FA 04 05 05 08 — сначала остановите демон
+./bin/ledctl -port /dev/ttyUSB1 rainbow -i 3 -s 3
+```
+
+- Перед запуском остановите демон (`docker compose stop` / `systemctl stop
+  s1panel`), чтобы порт был свободен.
+- Если `ledctl list` показал CH340 под другим номером, чем `/dev/ttyUSB0`:
+  поправьте `led.port` в конфиге **и** `devices:` в `docker-compose.yml` —
+  путь там жёстко зашит, и compose с неверным путём контейнер не поднимет.
+- Если `ledctl off` ленту погасил, а демон — нет: демон не открыл порт (в
+  логе строка `led: open ... (continuing without LED control)`) либо
+  применяет другой режим — посмотрите `journalctl -u s1panel | grep led`
+  или `docker compose logs s1panel | grep led`.
+- Если `ledctl off` ленту не погасил — к демону претензий нет: питание
+  панели, кабель, сам CH340.
+
+Ручное «выкл» из редактора живёт до перезапуска демона. После `docker
+compose restart`/redeploy лента снова берёт `"led": {"theme": …}` из
+`panel-data/config.json` — это живой конфиг контейнера, он засевается из
+`config.example.json` (theme 5, «автоматическая») только при первом запуске,
+поэтому правки `config.example.json` потом ни на что не влияют. Постоянное
+«выкл» — `"led": { "port": "/dev/ttyUSB0", "enabled": true, "theme": 4 }` в
+`panel-data/config.json`, затем `docker compose restart`.
 
 ## Протокол (коротко, полностью — doc/revrite.md §2)
 
