@@ -163,6 +163,35 @@ func (d *Display) IdleFor() time.Duration {
 // only meaningful while the panel has work pending.
 func (d *Display) Pending() int { return len(d.queue) }
 
+// DropPending discards queued-but-unstarted partial update jobs - a full
+// redraw supersedes them, and without this the panel paints the stale tiles
+// band by band before the resync lands (the "screen updates in shifted
+// strips" symptom). Heartbeat/orientation/redraw jobs are kept in their
+// original relative order; the job currently being written is untouched.
+// Returns how many update jobs were dropped.
+func (d *Display) DropPending() int {
+	var keep []*job
+	dropped := 0
+	for {
+		select {
+		case j := <-d.queue:
+			if j.label == "update" {
+				dropped++
+				continue
+			}
+			keep = append(keep, j)
+		default:
+			for _, j := range keep {
+				select {
+				case d.queue <- j:
+				default: // queue refilled concurrently; dropping the rest is safe
+				}
+			}
+			return dropped
+		}
+	}
+}
+
 // SetOrientation queues a set_orientation command (spec §2.1).
 func (d *Display) SetOrientation(ctx context.Context, orientation byte) error {
 	return d.post(ctx, &job{packets: [][]byte{OrientationPacket(orientation)}, label: "set_orientation"})
@@ -188,26 +217,55 @@ func (d *Display) Redraw(ctx context.Context, frame []byte) error {
 	return d.post(ctx, &job{packets: RedrawPackets(frame), label: "redraw"})
 }
 
-// Update queues one partial region update (spec §2.4). Callers pass pixels
-// already encoded RGB565 big-endian, row-major for the rect.
-func (d *Display) Update(ctx context.Context, r Rect, pixels []byte) error {
+// updatePacket validates r and its pixels and builds one CmdUpdate packet.
+func updatePacket(r Rect, pixels []byte) ([]byte, error) {
 	if r.Width <= 0 || r.Height <= 0 || r.Width > 255 || r.Height > 255 {
-		return fmt.Errorf("display: update rect %dx%d out of uint8 range", r.Width, r.Height)
+		return nil, fmt.Errorf("display: update rect %dx%d out of uint8 range", r.Width, r.Height)
 	}
 	// Coordinates go on the wire as uint16 LE: a negative origin would
 	// become 65535 and a rect spilling past the frame desyncs the panel.
 	if r.X < 0 || r.Y < 0 || r.X+r.Width > FrameWidth || r.Y+r.Height > FrameHeight {
-		return fmt.Errorf("display: update rect (%d,%d) %dx%d outside %dx%d frame",
+		return nil, fmt.Errorf("display: update rect (%d,%d) %dx%d outside %dx%d frame",
 			r.X, r.Y, r.Width, r.Height, FrameWidth, FrameHeight)
 	}
 	if r.Width*r.Height > MaxUpdatePixels {
-		return fmt.Errorf("display: update region %dx%d exceeds %d pixels per packet", r.Width, r.Height, MaxUpdatePixels)
+		return nil, fmt.Errorf("display: update region %dx%d exceeds %d pixels per packet", r.Width, r.Height, MaxUpdatePixels)
 	}
 	if len(pixels) < r.Width*r.Height*2 {
-		return fmt.Errorf("display: update needs %d pixel bytes, got %d", r.Width*r.Height*2, len(pixels))
+		return nil, fmt.Errorf("display: update needs %d pixel bytes, got %d", r.Width*r.Height*2, len(pixels))
 	}
-	p := UpdatePacket(r.X, r.Y, r.Width, r.Height, pixels)
+	return UpdatePacket(r.X, r.Y, r.Width, r.Height, pixels), nil
+}
+
+// Update queues one partial region update (spec §2.4). Callers pass pixels
+// already encoded RGB565 big-endian, row-major for the rect.
+func (d *Display) Update(ctx context.Context, r Rect, pixels []byte) error {
+	p, err := updatePacket(r, pixels)
+	if err != nil {
+		return err
+	}
 	return d.post(ctx, &job{packets: [][]byte{p}, label: "update"})
+}
+
+// Updates queues several partial regions as ONE job: the pieces of one
+// widget's SplitRect region stay contiguous on the wire, a heartbeat or the
+// next tick's regions cannot interleave between them, and Pending() counts a
+// whole widget refresh as one unit (upstream main.js blocks on the worker's
+// complete upcall before sending the next update; coalescing plus the app's
+// backlog guard approximates that backpressure).
+func (d *Display) Updates(ctx context.Context, rects []Rect, pixels func(Rect) []byte) error {
+	if len(rects) == 0 {
+		return nil
+	}
+	packets := make([][]byte, 0, len(rects))
+	for _, r := range rects {
+		p, err := updatePacket(r, pixels(r))
+		if err != nil {
+			return err
+		}
+		packets = append(packets, p)
+	}
+	return d.post(ctx, &job{packets: packets, label: "update"})
 }
 
 // Close stops the worker and closes the underlying transport, releasing the

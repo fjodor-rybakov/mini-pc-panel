@@ -232,6 +232,119 @@ func TestWriteFailureDoesNotKillWorker(t *testing.T) {
 	d.Close()
 }
 
+// Regression for the "panel refreshes in shifted/torn bands" symptom: the
+// SplitRect pieces of ONE widget go as one job, so a heartbeat queued while
+// the worker is mid-job can never slip between the widget's tiles.
+func TestUpdatesKeepsWidgetPiecesContiguous(t *testing.T) {
+	tr := newFakeTransport()
+	d := New(tr, 10*time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	subs := SplitRect(Rect{X: 10, Y: 162, Width: 300, Height: 6})
+	if len(subs) < 2 {
+		t.Fatalf("SplitRect produced %d pieces; need a multi-piece region", len(subs))
+	}
+	if err := d.Updates(ctx, subs, func(r Rect) []byte {
+		return make([]byte, r.Width*r.Height*2)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Queue the heartbeat while the worker is still writing the first
+	// piece: with separate Update() calls it used to interleave between
+	// tiles; as one job it must stay behind the whole block.
+	if err := d.Heartbeat(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitForWrites(t, tr, len(subs)+1)
+	d.Close()
+
+	for i, s := range subs {
+		p := tr.at(i)
+		if p[1] != CmdUpdate {
+			t.Fatalf("write %d cmd %02X, want update (pieces interleaved)", i, p[1])
+		}
+		if x := int(binary.LittleEndian.Uint16(p[2:4])); x != s.X {
+			t.Fatalf("write %d x=%d, want %d (pieces out of order)", i, x, s.X)
+		}
+	}
+	if hb := tr.at(len(subs)); hb[1] != CmdConfig || hb[2] != SubHeartbeat {
+		t.Fatalf("heartbeat did not follow the update block: %02X %02X", hb[1], hb[2])
+	}
+}
+
+// Updates rejects an invalid piece without posting the good pieces too - a
+// half-accepted batch would diverge the panel from the diff baseline.
+func TestUpdatesValidationRejectsWithoutPosting(t *testing.T) {
+	tr := newFakeTransport()
+	d := New(tr, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	if err := d.Updates(ctx, nil, func(Rect) []byte { return nil }); err != nil {
+		t.Fatalf("empty rects list should be a no-op, got %v", err)
+	}
+	good := Rect{X: 0, Y: 0, Width: 10, Height: 10}
+	bad := Rect{X: 310, Y: 0, Width: 20, Height: 10} // past the right frame edge
+	if err := d.Updates(ctx, []Rect{good, bad}, func(r Rect) []byte {
+		return make([]byte, r.Width*r.Height*2)
+	}); err == nil {
+		t.Fatal("bad piece must reject the whole batch")
+	}
+	if d.Pending() != 0 {
+		t.Fatal("rejected batch must not enter the queue")
+	}
+	if err := d.Updates(ctx, []Rect{good}, func(r Rect) []byte {
+		return make([]byte, r.Width*r.Height*2)
+	}); err != nil {
+		t.Fatalf("valid batch rejected: %v", err)
+	}
+	waitForWrites(t, tr, 1)
+	d.Close()
+}
+
+// A resync full redraw must not queue behind the stale partials it
+// supersedes: DropPending drains queued update jobs but keeps commands the
+// redraw does not supersede (orientation, heartbeat) in order.
+func TestDropPendingDropsOnlyQueuedUpdates(t *testing.T) {
+	tr := newFakeTransport()
+	d := New(tr, time.Millisecond, 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// No Start yet: the queue stays untouched while we drain it.
+
+	if err := d.Update(ctx, Rect{X: 0, Y: 0, Width: 10, Height: 10}, make([]byte, 200)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Update(ctx, Rect{X: 20, Y: 0, Width: 10, Height: 10}, make([]byte, 200)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetOrientation(ctx, OrientationPortrait); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Heartbeat(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if n := d.DropPending(); n != 2 {
+		t.Fatalf("DropPending() = %d, want 2", n)
+	}
+	if p := d.Pending(); p != 2 {
+		t.Fatalf("Pending() = %d after drain, want 2 (orientation + heartbeat kept)", p)
+	}
+
+	d.Start(ctx)
+	waitForWrites(t, tr, 2)
+	d.Close()
+	if p := tr.at(0); p[1] != CmdConfig || p[2] != SubOrientation {
+		t.Fatalf("first surviving job is not the orientation command: %02X %02X", p[1], p[2])
+	}
+	if p := tr.at(1); p[1] != CmdConfig || p[2] != SubHeartbeat {
+		t.Fatalf("second surviving job is not the heartbeat: %02X %02X", p[1], p[2])
+	}
+}
+
 func TestPostAfterCloseFails(t *testing.T) {
 	tr := newFakeTransport()
 	d := New(tr, time.Millisecond, 20*time.Millisecond)

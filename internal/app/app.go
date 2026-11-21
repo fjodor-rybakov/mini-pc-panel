@@ -46,6 +46,9 @@ type App struct {
 	previewUntil   time.Time
 	previewLED     bool // preview pushed the draft screen's LED; restore after it expires
 	lastHeartbeat  time.Time
+	// lastBackoffLog rate-limits the "panel link behind" log; only the
+	// Run/tick goroutine touches it, so it needs no lock.
+	lastBackoffLog time.Time
 	manualLED      *config.LEDSettings // editor-driven LED set (outranks config)
 	lastLEDTheme   int                 // mode the strip now holds (0 = nothing sent)
 }
@@ -267,18 +270,36 @@ func (a *App) tick(ctx context.Context) error {
 	}
 	a.rotateScreen()
 
-	frame, err := a.renderCurrent()
-	if err != nil {
-		return err
-	}
-
 	a.mu.Lock()
 	last := a.lastFrame
 	full := a.forceRedraw
 	themeRefresh := a.theme.Refresh == "redraw"
 	a.mu.Unlock()
 
+	// Upstream main.js only sends the next update after the lcd worker's
+	// "complete" upcall, so its queue never backs up; our post() is
+	// fire-and-forget. On a slow link the tiles of older frames would
+	// otherwise keep painting onto the panel band by band - the visible
+	// "shifted/torn strips" symptom. While jobs are still queued, defer
+	// this tick's partial refresh: lastFrame stays the last SENT frame, so
+	// the newest frame is diffed against it next tick and no stale tiles
+	// enter the queue. Full redraws still go through (DropPending below).
+	if pending := a.disp.Pending(); !full && !themeRefresh && last != nil && pending > 0 {
+		a.noteBacklog(pending)
+		return nil
+	}
+
+	frame, err := a.renderCurrent()
+	if err != nil {
+		return err
+	}
+
 	if last == nil || full || themeRefresh {
+		// A full redraw repaints everything the queued partials were about
+		// to paint; letting them run first only shows stale bands under it.
+		if n := a.disp.DropPending(); n > 0 {
+			log.Printf("app: dropping %d stale queued update job(s) before full redraw", n)
+		}
 		if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
 			return err
 		}
@@ -300,20 +321,35 @@ func (a *App) tick(ctx context.Context) error {
 		if last.SameRegion(frame, dr.X, dr.Y, dr.Width, dr.Height) {
 			continue
 		}
-		for _, sub := range display.SplitRect(display.Rect{X: dr.X, Y: dr.Y, Width: dr.Width, Height: dr.Height}) {
-			if err := a.disp.Update(ctx, sub, frame.Region(sub.X, sub.Y, sub.Width, sub.Height)); err != nil {
-				// Earlier sub-rects may already be on the panel: the screen
-				// is now a mix of old and new frames. Don't adopt this frame
-				// as the baseline - resync with a full redraw next tick.
-				a.mu.Lock()
-				a.forceRedraw = true
-				a.mu.Unlock()
-				return err
-			}
+		// One job per widget: its SplitRect pieces stay contiguous on the
+		// wire with no heartbeat or other widget's pieces interleaving
+		// between them (a half-painted region interrupted mid-way is what
+		// reads as a torn band).
+		pieces := display.SplitRect(display.Rect{X: dr.X, Y: dr.Y, Width: dr.Width, Height: dr.Height})
+		if err := a.disp.Updates(ctx, pieces, func(r display.Rect) []byte {
+			return frame.Region(r.X, r.Y, r.Width, r.Height)
+		}); err != nil {
+			// Earlier jobs may already be on the panel: the screen is now a
+			// mix of old and new frames. Don't adopt this frame as the
+			// baseline - resync with a full redraw next tick.
+			a.mu.Lock()
+			a.forceRedraw = true
+			a.mu.Unlock()
+			return err
 		}
 	}
 	a.setLastFrame(frame)
 	return nil
+}
+
+// noteBacklog logs the deferral at most once a minute (a slow link makes it
+// fire on many consecutive ticks). Only the Run/tick goroutine calls it.
+func (a *App) noteBacklog(pending int) {
+	if time.Since(a.lastBackoffLog) < time.Minute {
+		return
+	}
+	a.lastBackoffLog = time.Now()
+	log.Printf("app: panel link behind (%d queued job(s)): deferring partial refresh; raise packet_delay/redraw_delay in config.json if this persists", pending)
 }
 
 // rotateScreen advances to the next enabled screen once the screen duration
