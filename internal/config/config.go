@@ -126,6 +126,11 @@ type Config struct {
 	// Dir is the directory of the config file; ThemeFile and font paths are
 	// resolved relative to it. Not part of the JSON.
 	Dir string `json:"-"`
+
+	// Path is the config file itself (recorded by Load). SaveLED rewrites it
+	// so LED choices from the editor survive restarts, like the original
+	// GUI did. Not part of the JSON.
+	Path string `json:"-"`
 }
 
 // UnmarshalJSON accepts the original s1panel config.json spellings:
@@ -180,6 +185,59 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// SaveLED persists strip settings into the config file the daemon loaded,
+// mirroring the original set_led_strip (s1panel/api.js:309-316): every LED
+// apply from the GUI rewrote the led block in config.json, so an "off"
+// survived restarts instead of being re-lit by the config on next start.
+// The document is merged through a raw JSON map so keys Go's Config does not
+// model (the original canvas/widgets/sensors entries) survive untouched, and
+// the block keeps the spelling the file already uses ("led" or the original
+// "led_config"); a file with neither gets "led". Port/enabled and any other
+// keys inside the block are left as they are.
+func SaveLED(cfg *Config, s LEDSettings) error {
+	if cfg.Path == "" {
+		return fmt.Errorf("config: no config file path recorded, cannot persist LED settings")
+	}
+	raw, err := os.ReadFile(cfg.Path)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("config: parse %s: %w", cfg.Path, err)
+	}
+	key := "led"
+	if _, ok := doc["led"]; !ok {
+		if _, ok := doc["led_config"]; ok {
+			key = "led_config"
+		}
+	}
+	block := map[string]any{}
+	if cur, ok := doc[key]; ok {
+		if err := json.Unmarshal(cur, &block); err != nil {
+			return fmt.Errorf("config: led block in %s: %w", cfg.Path, err)
+		}
+		if block == nil { // literal null in the file
+			block = map[string]any{}
+		}
+	}
+	block["theme"], block["intensity"], block["speed"] = s.Theme, s.Intensity, s.Speed
+	updated, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	doc[key] = updated
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(cfg.Path, append(out, '\n'), 0o644); err != nil {
+		return fmt.Errorf("config: write %s: %w", cfg.Path, err)
+	}
+	cfg.LED.LEDSettings = s // keep the live config in sync with the file
+	return nil
+}
+
 // Load reads and validates the config file at path.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -192,6 +250,7 @@ func Load(path string) (*Config, error) {
 	}
 	cfg.applyDefaults()
 	cfg.Dir = filepath.Dir(path)
+	cfg.Path = path
 	if cfg.ThemeFile != "" && !filepath.IsAbs(cfg.ThemeFile) {
 		cfg.ThemeFile, err = joinInDir(cfg.Dir, cfg.ThemeFile)
 		if err != nil {
@@ -289,13 +348,16 @@ func (c *Config) applyDefaults() {
 		c.Sensors.MountPoints = []string{"/"}
 	}
 	if len(c.Sensors.HwmonChips) == 0 {
-		c.Sensors.HwmonChips = []string{"coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz", "nvme"}
+		// "rapl" = the kernel's intel_rapl hwmon chip: exposes package
+		// power as power*_input even when /sys/class/powercap is not
+		// visible (Docker masks /sys/devices/virtual/powercap by default).
+		c.Sensors.HwmonChips = []string{"coretemp", "k10temp", "zenpower", "rapl", "cpu_thermal", "acpitz", "nvme"}
 	}
 	if len(c.Sensors.HwmonTempLabels) == 0 {
 		c.Sensors.HwmonTempLabels = []string{"Package id 0", "Tctl", "Tdie", "Composite", "temp1_input"}
 	}
 	if len(c.Sensors.HwmonPowerLabels) == 0 {
-		c.Sensors.HwmonPowerLabels = []string{"Package power", "CPU power", "power1_input"}
+		c.Sensors.HwmonPowerLabels = []string{"Package power", "CPU power", "Package", "power1_input"}
 	}
 	if c.Sensors.MaxPoints <= 0 {
 		c.Sensors.MaxPoints = 300 // original max_points default
@@ -380,7 +442,7 @@ type Rect struct {
 // Original themes write fonts as CSS strings: "17px Arial", "bold 18px Arial".
 type FontSpec struct {
 	Family string  `json:"family"`
-	Size   float64 `json:"size"` // treated as mm == px at DPMM(1.0)
+	Size   float64 `json:"size"` // CSS px == panel px; drawTextWidget converts to PostScript points for canvas Face()
 	Bold   bool    `json:"bold"`
 }
 

@@ -151,25 +151,46 @@ make ledctl
 ./bin/ledctl -port /dev/ttyUSB1 rainbow -i 3 -s 3
 ```
 
+Тот же `ledctl` лежит в docker-образе (в контейнере порт всегда
+`/dev/ttyUSB0`):
+
+```sh
+docker compose stop
+docker compose run --rm --entrypoint ledctl s1panel list
+docker compose run --rm --entrypoint ledctl s1panel off
+docker compose up -d
+```
+
 - Перед запуском остановите демон (`docker compose stop` / `systemctl stop
   s1panel`), чтобы порт был свободен.
 - Если `ledctl list` показал CH340 под другим номером, чем `/dev/ttyUSB0`:
-  поправьте `led.port` в конфиге **и** `devices:` в `docker-compose.yml` —
-  путь там жёстко зашит, и compose с неверным путём контейнер не поднимет.
-- Если `ledctl off` ленту погасил, а демон — нет: демон не открыл порт (в
-  логе строка `led: open ... (continuing without LED control)`) либо
-  применяет другой режим — посмотрите `journalctl -u s1panel | grep led`
-  или `docker compose logs s1panel | grep led`.
+  поправьте `led.port` в конфиге, а в docker задайте узел хоста переменной
+  `LED_DEVICE` — в `docker-compose.yml` теперь
+  `- ${LED_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0`, то есть
+  `LED_DEVICE=/dev/ttyUSB1 docker compose up -d --build`. Сам демон тоже
+  ищет CH340 (VID `1a86`) среди видимых портов: если `led.port` не CH340
+  или отсутствует, а CH340 ровно один — открывается он, и это пишется в лог.
+- Если `ledctl off` ленту погасил, а демон — нет: сравните
+  `journalctl -u s1panel | grep led` (или `docker compose logs s1panel | grep led`)
+  с действиями редактора. Демон теперь пишет при старте `led: opened <порт>
+  (VID=... PID=...)` и список всех видимых портов, а при каждой отправке —
+  кадр целиком (`led: frame FA 04 05 05 08 -> /dev/ttyUSB0`,
+  `led: manual frame ...`). Нет строки `frame` — демон кадр не шлёт (порт
+  не открыт или стоит режим theme 6 «ignore»); строка есть, а лента горит —
+  кадр уходит не в то устройство (проверьте `LED_DEVICE` / `led.port`).
 - Если `ledctl off` ленту не погасил — к демону претензий нет: питание
   панели, кабель, сам CH340.
 
-Ручное «выкл» из редактора живёт до перезапуска демона. После `docker
-compose restart`/redeploy лента снова берёт `"led": {"theme": …}` из
-`panel-data/config.json` — это живой конфиг контейнера, он засевается из
-`config.example.json` (theme 5, «автоматическая») только при первом запуске,
-поэтому правки `config.example.json` потом ни на что не влияют. Постоянное
-«выкл» — `"led": { "port": "/dev/ttyUSB0", "enabled": true, "theme": 4 }` в
-`panel-data/config.json`, затем `docker compose restart`.
+Ручное «выкл» из редактора сохраняется на диске: каждый «применить LED»
+пишет `theme/intensity/speed` в живой конфиг контейнера
+`panel-data/config.json` (он засевается из `config.example.json` только при
+первом запуске, поэтому правки `config.example.json` потом ни на что не
+влияют) — ровно так же делал оригинальный GUI (`api.js set_led_strip`).
+Значит «выкл» переживает `docker compose restart`/redeploy, а если CH340
+в момент команды недоступен, режим всё равно записан и применится при
+следующем старте (ответ редактора содержит `"saved": true|false`). Если
+нужно задать режим руками: `"led": { "port": "/dev/ttyUSB0", "enabled":
+true, "theme": 4 }` в `panel-data/config.json`, затем `docker compose restart`.
 
 ## Протокол (коротко, полностью — doc/revrite.md §2)
 
@@ -217,6 +238,10 @@ compose restart`/redeploy лента снова берёт `"led": {"theme": …
   (`config.ParseTheme`), рендерится и отправляется **на физический экран**
   (полный redraw + LED экрана), в ответ приходит PNG того, что теперь показывает
   панель; тишина опроса на время показа превью.
+- **Живое превью «как видит экран»** — `POST /api/render?screen=N`: та же
+  валидация и рендер, но **без касания панели**; редактор обновляет картинку
+  в футере (родные 320×170) дебаунсом в 500 мс после любой правки — картинка
+  больше не появляется только после «Применить».
 - **«Применить»** — хот-своп живой темы (`POST /api/apply`), `?save=1` пишет
   `theme_file`; «Сохранить и применить» — то же с сохранением.
 - LED вручную: тема/яркость/скорость (тема 1..6, в редакторе 1..5) →
@@ -224,10 +249,10 @@ compose restart`/redeploy лента снова берёт `"led": {"theme": …
   Как оригинальный `led_device.js`, кадр отправляется побайтно с паузой
   5 мс между байтами — прошивка ленты отбрасывает плотный burst, и полоса
   остаётся в прежнем режиме (в том числе не гаснет от `off`).
-  Отправленные настройки становятся живым глобалом до перезапуска демона
-  (`config.json` не пишется): ротация экрана их не откатывает, но
-  `led_config` конкретного экрана по-прежнему перебивает их. Постоянный
-  «выкл» — `"led": {"theme": 4}` в конфиге.
+  Отправленные настройки становятся живым глобалом и пишутся в `config.json`
+  (как в оригинале — см. «Диагностика ленты»): ротация экрана их не
+  откатывает, но `led_config` конкретного экрана по-прежнему перебивает их,
+  а «выкл» переживает перезапуск демона.
 - **Живое переключение тем** (как дропдаун оригинального GUI): `GET /api/themes`
   отдаёт `theme_list` + текущий `theme_file`, `POST /api/theme {"file":…}` или
   `{"name":…}` грузит тему из списка на живую; `config.json` на диске не
@@ -280,8 +305,12 @@ compose restart`/redeploy лента снова берёт `"led": {"theme": …
   всегда делится на фактический интервал между сэмплами — оригинал делил
   лишь «примерно раз в секунду», поэтому показания могут немного
   отличаться. Если RAPL нет, hwmon-фолбэк перебирает чипы по приоритету
-  (`coretemp, k10temp, zenpower, cpu_thermal, acpitz, nvme`) — мощность
-  NVMe больше не попадёт в `cpu_power`.
+  (`coretemp, k10temp, zenpower, rapl, cpu_thermal, acpitz, nvme`) —
+  чип `rapl` это hwmon-представление RAPL в новых ядрах; мощность NVMe
+  больше не попадёт в `cpu_power`. В Docker учтено отдельно: он маскирует
+  `/sys/devices/virtual/powercap`, и без read-only bind-mount этого каталога
+  (есть в `docker-compose.yml`) RAPL-зон в контейнере не видно — датчик
+  давал `cpu_power: N/A`.
 - Валидация конфига строгая: `vid`/`pid` — целые в диапазоне 0..65535
   (обрезки не будет), относительные пути тем не могут выходить за каталог
   конфига, `led.theme` 1..6 и `led.intensity`/`led.speed` 1..5,

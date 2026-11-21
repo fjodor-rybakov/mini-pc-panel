@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,10 +78,19 @@ func New(cfg *config.Config) (*App, error) {
 		forceRedraw: true,
 	}
 	if cfg.LED.Enabled == nil || *cfg.LED.Enabled {
-		dev, err := led.Open(cfg.LED.Port)
+		// OpenAuto resolves the CH340 by USB identity (VID 1a86) when the
+		// configured port is missing or belongs to another adapter: a
+		// wrong ttyUSB index is the classic "off went nowhere" failure,
+		// and both the chosen port and the full port list land in the log.
+		dev, note, err := led.OpenAuto(cfg.LED.Port)
+		if note != "" {
+			log.Printf("led: %s", note)
+		}
 		if err != nil {
 			log.Printf("led: %v (continuing without LED control)", err)
 		} else {
+			log.Printf("led: opened %s (VID=%s PID=%s)", dev.Name, dev.VID, dev.PID)
+			log.Printf("led: serial ports visible here: %s", portsSummary())
 			a.led = dev
 		}
 	}
@@ -457,10 +467,13 @@ func (a *App) applyScreenLED(sc *config.Screen) {
 }
 
 // applyScreenLEDLocked merges the per-screen led_config over the global LED
-// settings field by field (zero = inherit). The original fell back to
-// theme||4 on screen change but led_thread.js re-applied the global
-// settings every 3 s; there is no such loop here, so inheriting the global
-// defaults (config defaults to theme 5/3/3) is the documented deviation.
+// settings field by field (zero = inherit). The original overwrote all
+// three fields wholesale on screen change (main.js:296-298, theme||4) and
+// only set update_led then - there is no periodic re-apply loop: a frame
+// goes out at startup, on screen changes INTO screens that HAVE led_config,
+// and on editor applies. Shipped themes carry no per-screen led_config at
+// all, so in practice the global/manual side drives the strip; inheriting
+// missing fields from the global settings is the documented deviation.
 // The global side of that merge starts from the editor's manual settings
 // when present (manualLED): without that, an "off" pushed from the editor
 // was undone by the very next screen rotation, which re-applied the config
@@ -492,12 +505,14 @@ func (a *App) applyScreenLEDLocked(sc *config.Screen) {
 		if err := a.led.Off(); err != nil {
 			log.Printf("app: led off: %v", err)
 		} else {
+			log.Printf("app: led: off frame % X -> %s", led.OffPacket(), a.led.Name)
 			a.lastLEDTheme = s.Theme
 		}
 	default:
 		if err := a.led.Set(s.Theme, s.Intensity, s.Speed); err != nil {
 			log.Printf("app: led set: %v", err)
 		} else {
+			log.Printf("app: led: frame % X -> %s", led.Packet(s.Theme, s.Intensity, s.Speed), a.led.Name)
 			a.lastLEDTheme = s.Theme
 		}
 	}
@@ -506,9 +521,10 @@ func (a *App) applyScreenLEDLocked(sc *config.Screen) {
 // ApplyLEDManual pushes explicit strip settings (editor "apply LED" action).
 // Config-scale intensity/speed; theme 6 sends nothing (original ignore).
 // The settings also become the live global for every later screen change,
-// so an editor "off" is no longer undone by the next rotation. They last
-// for the process lifetime only: the daemon never writes config.json, so a
-// restart falls back to its led block.
+// so an editor "off" is no longer undone by the next rotation. The HTTP
+// handler persists them with PersistLED before calling this - the original
+// set_led_strip rewrote config.json the same way (api.js:309-316) - so the
+// choice survives a restart too.
 func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 	if a.led == nil {
 		return fmt.Errorf("app: led device not open")
@@ -535,6 +551,7 @@ func (a *App) ApplyLEDManual(settings config.LEDSettings) error {
 	}
 	if settings.Theme != led.ThemeIgnore {
 		a.lastLEDTheme = settings.Theme
+		log.Printf("app: led: manual frame % X -> %s", manualFrame(settings), a.led.Name)
 	}
 	m := settings
 	a.manualLED = &m
@@ -557,7 +574,40 @@ func (a *App) shutdownLED() {
 		log.Printf("app: led off on shutdown: %v", err)
 		return
 	}
-	log.Printf("app: led off sent on shutdown")
+	log.Printf("app: led off sent on shutdown to %s", a.led.Name)
+}
+
+// portsSummary renders every serial port this process can see for the
+// startup log ("ttyUSB0[067b:2303] ttyUSB1[1a86:7523] <- CH340"). One
+// grep-able line that answers "is the CH340 even visible here?" - wrong
+// ttyUSB indices and missing docker device mappings both fail exactly
+// this question.
+func portsSummary() string {
+	ports, err := led.ListPorts()
+	if err != nil {
+		return "enumeration failed: " + err.Error()
+	}
+	if len(ports) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		part := fmt.Sprintf("%s[%s:%s]", p.Name, p.VID, p.PID)
+		if led.IsCH340(p) {
+			part += " <- CH340"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " ")
+}
+
+// manualFrame is the exact bytes ApplyLEDManual just pushed; logging it
+// makes a "still lit" report decidable from the daemon log alone.
+func manualFrame(s config.LEDSettings) []byte {
+	if s.Theme == led.ThemeOff {
+		return led.OffPacket()
+	}
+	return led.Packet(s.Theme, s.Intensity, s.Speed)
 }
 
 // ---- editor / admin hooks ----
@@ -675,6 +725,17 @@ func (a *App) ManualLED() (config.LEDSettings, bool) {
 		return config.LEDSettings{}, false
 	}
 	return *a.manualLED, true
+}
+
+// PersistLED writes the given strip settings into the config file on disk so
+// the choice survives a daemon/container restart — the original GUI did the
+// same on every set_led_strip (s1panel/api.js:309-316). Without it a manual
+// "off" lived only in memory and the next start re-applied the config's
+// theme and re-lit the strip, which is what made "выкл" look ignored.
+func (a *App) PersistLED(s config.LEDSettings) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return config.SaveLED(a.cfg, s)
 }
 
 // CurrentScreenIndex is the screen currently shown (editor highlight).

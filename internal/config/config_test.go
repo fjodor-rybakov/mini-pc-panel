@@ -46,6 +46,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Dir != dir {
 		t.Fatalf("Dir = %q, want %q", cfg.Dir, dir)
 	}
+	if cfg.Path != path {
+		t.Fatalf("Path = %q, want %q (SaveLED needs it)", cfg.Path, path)
+	}
 	if want := filepath.Join(dir, "themes", "demo.json"); cfg.ThemeFile != want {
 		t.Fatalf("ThemeFile = %q, want %q (resolved against config dir)", cfg.ThemeFile, want)
 	}
@@ -383,5 +386,120 @@ func TestSaveThemeRoundTrip(t *testing.T) {
 	}
 	if got.Screens[0].Duration != th.Screens[0].Duration {
 		t.Fatalf("duration lost in round trip: %d vs %d", got.Screens[0].Duration, th.Screens[0].Duration)
+	}
+}
+
+// The original set_led_strip rewrote the led block in config.json on every
+// GUI apply (s1panel/api.js:309-316), so "off" survived a restart. SaveLED
+// must do the same: update theme/intensity/speed in place, keep the port
+// and every key Go does not model, and leave a file that still loads.
+func TestSaveLEDPersistsAndKeepsUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	original := `{"theme_file":"themes/demo.json","canvas":{"w":320},"led":{"port":"/dev/ttyUSB1","enabled":true,"theme":5,"intensity":2,"speed":4}}`
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := LEDSettings{Theme: 4, Intensity: 3, Speed: 3}
+	if err := SaveLED(cfg, want); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LED.LEDSettings != want {
+		t.Errorf("live config not updated: %+v", cfg.LED.LEDSettings)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, keep := range []string{`"canvas"`, `"port": "/dev/ttyUSB1"`, `"enabled": true`} {
+		if !strings.Contains(string(raw), keep) {
+			t.Errorf("saved file lost %s:\n%s", keep, raw)
+		}
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("saved file no longer loads: %v", err)
+	}
+	if reloaded.LED.LEDSettings != want {
+		t.Errorf("reloaded led = %+v, want %+v", reloaded.LED.LEDSettings, want)
+	}
+}
+
+// An original s1panel config.json spells the block "led_config" with a
+// "device" key; SaveLED updates that key instead of adding a second block,
+// and the result still loads (UnmarshalJSON folds led_config into LED).
+func TestSaveLEDKeepsOriginalLedConfigSpelling(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	original := `{"theme":"themes/demo.json","led_config":{"device":"/dev/ttyUSB0","theme":2,"intensity":3,"speed":3}}`
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveLED(cfg, LEDSettings{Theme: 4, Intensity: 3, Speed: 3}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["led"]; ok {
+		t.Error("SaveLED added a second led block next to the original led_config")
+	}
+	var blk map[string]any
+	if err := json.Unmarshal(doc["led_config"], &blk); err != nil {
+		t.Fatalf("led_config block invalid: %v", err)
+	}
+	if blk["theme"] != float64(4) {
+		t.Errorf("led_config.theme = %v, want 4", blk["theme"])
+	}
+	if blk["device"] != "/dev/ttyUSB0" {
+		t.Errorf("led_config.device = %v, the device key must survive", blk["device"])
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.LED.Theme != 4 || reloaded.LED.Port != "/dev/ttyUSB0" {
+		t.Errorf("reloaded led = %+v, want theme 4 port /dev/ttyUSB0", reloaded.LED)
+	}
+}
+
+// A config without any led block gets one; a Config not produced by Load
+// has no file to write to and must fail loudly instead of silently
+// dropping the user's choice.
+func TestSaveLEDCreatesLedBlockWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(path, []byte(`{"theme_file":"themes/demo.json"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveLED(cfg, LEDSettings{Theme: 4, Intensity: 5, Speed: 5}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.LED.Theme != 4 || reloaded.LED.Intensity != 5 || reloaded.LED.Speed != 5 {
+		t.Errorf("led after create = %+v, want 4/5/5", reloaded.LED.LEDSettings)
+	}
+	if err := SaveLED(&Config{}, LEDSettings{Theme: 4}); err == nil {
+		t.Fatal("no path recorded: SaveLED must return an error, not drop the settings")
 	}
 }

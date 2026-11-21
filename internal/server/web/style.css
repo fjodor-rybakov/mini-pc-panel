@@ -1,4 +1,20 @@
 /* S1 panel widget editor — dark, compact, no build step. */
+/* The editor canvas must measure and rasterise with the SAME typeface the
+   Go renderer embeds (internal/render/fonts.go -> Latin Modern from
+   go-fonts); otherwise grid text and panel text never match in size.
+   These files are the identical font bytes, dumped from the Go module. */
+@font-face {
+  font-family: "Latin Modern Sans";
+  src: url("fonts/lmsans10regular.otf");
+  font-weight: normal;
+  font-style: normal;
+}
+@font-face {
+  font-family: "Latin Modern Sans";
+  src: url("fonts/lmsans10bold.otf");
+  font-weight: bold;
+  font-style: normal;
+}
 * { box-sizing: border-box; }
 body {
   margin: 0; background: #14161a; color: #e6e6e6;
@@ -57,7 +73,15 @@ footer {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 8px 14px; background: #1d2026; border-top: 1px solid #2c313a;
 }
-#previewImg { height: 44px; border: 1px solid #3a4150; border-radius: 4px; background: #000; }
-.led { display: flex; align-items: center; gap: 5px; color: #aab; }
+/* Живое превью «как видит экран»: родные 320x170, чтобы текст читался
+   без «Примерить на экран» и без «Применить». */
+#previewImg { width: 320px; height: 170px; object-fit: contain; image-rendering: pixelated; border: 1px solid #3a4150; border-radius: 4px; background: #000; }
+/* LED controls live in the header and must not blend into the theme picker:
+   a boxed, self-labelled group is what makes "Применить LED" findable. */
+.led {
+  display: flex; align-items: center; gap: 6px; color: #cdd6e4;
+  background: #232936; border: 1px solid #3f4c66; border-radius: 6px;
+  padding: 5px 10px; font-weight: 600;
+}
 #status { color: #8cf; font-family: monospace; }
 kbd { background:#262a32; border:1px solid #3a4150; border-radius:3px; padding:0 4px; font-family:monospace; }

@@ -23,17 +23,19 @@ const validDraft = `{"orientation":"landscape","screens":[{"id":1,"widgets":[{"i
 // fakePanel implements Panel so the HTTP layer is exercised without any
 // HID/serial hardware.
 type fakePanel struct {
-	dir       string
-	cfg       *config.Config
-	theme     *config.Theme
-	swapped   int
-	previews  int
-	next      int
-	shown     []int
-	pauses    []bool
-	lastLED   config.LEDSettings
-	manualLED *config.LEDSettings
-	ledErr    error
+	dir        string
+	cfg        *config.Config
+	theme      *config.Theme
+	swapped    int
+	previews   int
+	next       int
+	shown      []int
+	pauses     []bool
+	lastLED    config.LEDSettings
+	manualLED  *config.LEDSettings
+	ledErr     error
+	savedLED   *config.LEDSettings
+	persistErr error
 }
 
 func newPanel(t *testing.T) *fakePanel {
@@ -102,6 +104,16 @@ func (f *fakePanel) ManualLED() (config.LEDSettings, bool) {
 		return config.LEDSettings{}, false
 	}
 	return *f.manualLED, true
+}
+
+// PersistLED mirrors app.App.PersistLED: settings the handler asked to keep
+// are recorded, unless the (virtual) disk fails.
+func (f *fakePanel) PersistLED(s config.LEDSettings) error {
+	if f.persistErr != nil {
+		return f.persistErr
+	}
+	f.savedLED = &s
+	return nil
 }
 
 func (f *fakePanel) NextScreen() { f.next++ }
@@ -263,6 +275,33 @@ func TestPreviewRejections(t *testing.T) {
 	}
 }
 
+// The live editor thumbnail must work BEFORE any apply: /api/render renders
+// the draft server-side only — the physical panel never sees it.
+func TestRenderPNGDoesNotTouchPanel(t *testing.T) {
+	ts, p := newTestServer(t)
+	resp, err := http.Post(ts.URL+"/api/render?screen=0", "application/json", strings.NewReader(validDraft))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("content-type %q, want image/png", ct)
+	}
+	cfg, err := png.DecodeConfig(resp.Body)
+	if err != nil {
+		t.Fatalf("render body is not a PNG: %v", err)
+	}
+	if cfg.Width != 320 || cfg.Height != 170 {
+		t.Fatalf("render PNG %dx%d, want 320x170", cfg.Width, cfg.Height)
+	}
+	if p.previews != 0 {
+		t.Fatalf("PreviewOnScreen calls = %d, want 0 (render must not touch hardware)", p.previews)
+	}
+}
+
 func TestApplyHotSwapAndSave(t *testing.T) {
 	ts, p := newTestServer(t)
 	resp, err := http.Post(ts.URL+"/api/apply?save=1", "application/json", strings.NewReader(validDraft))
@@ -323,6 +362,18 @@ func TestLEDApply(t *testing.T) {
 	if p.lastLED.Theme != 2 || p.lastLED.Intensity != 1 || p.lastLED.Speed != 4 {
 		t.Fatalf("LED settings forwarded as %+v", p.lastLED)
 	}
+	// The original set_led_strip also rewrote the led block in config.json
+	// (s1panel/api.js:309-316); the port must report that and remember it.
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["ok"] != true || out["saved"] != true {
+		t.Fatalf("apply reply %v, want ok:true saved:true", out)
+	}
+	if p.savedLED == nil || *p.savedLED != p.lastLED {
+		t.Fatalf("persisted %v, want %+v", p.savedLED, p.lastLED)
+	}
 
 	// serial failure -> 502
 	p.ledErr = fmt.Errorf("serial: port busy")
@@ -333,6 +384,32 @@ func TestLEDApply(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("LED error: status %d, want 502", resp.StatusCode)
+	}
+}
+
+// A failing config write must not block the strip command: the original
+// wrote config.json and pushed the mode independently, so the frame still
+// goes out and the reply just reports saved:false.
+func TestLEDApplySurvivesPersistFailure(t *testing.T) {
+	ts, p := newTestServer(t)
+	p.persistErr = fmt.Errorf("read-only filesystem")
+	resp, err := http.Post(ts.URL+"/api/led", "application/json", strings.NewReader(`{"theme":4,"intensity":3,"speed":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 despite the failed save", resp.StatusCode)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["saved"] != false {
+		t.Errorf("reply %v, want saved:false", out)
+	}
+	if p.lastLED.Theme != 4 {
+		t.Errorf("strip got %+v; a save failure must not block the frame", p.lastLED)
 	}
 }
 
@@ -568,5 +645,17 @@ func TestPauseEndpoint(t *testing.T) {
 		if p.pauses[i] != w {
 			t.Fatalf("pauses[%d] = %v, want %v", i, p.pauses[i], w)
 		}
+	}
+}
+
+// The editor HTML/JS is embedded, so after an image rebuild browsers kept
+// serving the cached app.js (zero modTime -> no Last-Modified -> heuristic
+// freshness). The "/" route must tell them to revalidate every load.
+func TestEditorAssetsSendNoCache(t *testing.T) {
+	s := New(&fakePanel{}, "127.0.0.1:0")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", got)
 	}
 }

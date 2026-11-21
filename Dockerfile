@@ -39,6 +39,9 @@ RUN go mod download
 
 COPY . .
 RUN go build -tags libusb -trimpath -ldflags="-s -w" -o /out/s1panel ./cmd/s1panel
+# ledctl — чистый Go (без cgo): диагностика ленты прямо внутри контейнера,
+# docker compose run --rm --entrypoint ledctl s1panel list|off
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ledctl ./cmd/ledctl
 
 ########## runtime stage ##########
 FROM debian:bookworm-slim
@@ -52,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/s1panel /usr/local/bin/s1panel
+COPY --from=build /out/ledctl /usr/local/bin/ledctl
 
 # дефолтные конфиг/темы: entrypoint засеет их в том, что смонтировано в /etc/s1panel
 COPY config.example.json /opt/s1panel/config.example.json

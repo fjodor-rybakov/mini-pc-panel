@@ -31,9 +31,9 @@
   "sensors": {
     "network_interfaces": ["eth0", "wlan0"],
     "mount_points": ["/"],
-    "hwmon_chips": ["coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz", "nvme"],
+    "hwmon_chips": ["coretemp", "k10temp", "zenpower", "rapl", "cpu_thermal", "acpitz", "nvme"],
     "hwmon_temp_labels": ["Package id 0", "Tctl", "Tdie", "Composite", "temp1_input"],
-    "hwmon_power_labels": ["Package power", "CPU power", "power1_input"],
+    "hwmon_power_labels": ["Package power", "CPU power", "Package", "power1_input"],
     "max_points": 300,
     "fahrenheit": false,
     "scaling": 1.5

@@ -184,7 +184,9 @@ func (s *powerSensor) Sample() (Reading, error) {
 	} else {
 		hit, err := findHwmon(s.hwmonRoot, s.chips, s.labels, "power")
 		if err != nil {
-			return Reading{}, fmt.Errorf("cpu_power: no RAPL zones under %s and no hwmon fallback: %w", s.raplRoot, err)
+			// Inside Docker the usual cause: the default mask hides
+			// /sys/devices/virtual/powercap (bind-mount it read-only).
+			return Reading{}, fmt.Errorf("cpu_power: no RAPL zones under %s and no hwmon power input on chips %v: %w", s.raplRoot, s.chips, err)
 		}
 		watts = hit.raw / 1e6 // microwatts -> W
 	}

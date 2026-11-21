@@ -12,8 +12,16 @@ services:
       # (/dev/hidrawN) контейнеру не нужны, нужен доступ к USB-шине.
       # Дем сам выбирает экранный интерфейс панели (см. README).
       - /dev/bus/usb:/dev/bus/usb
+      # Docker маскирует /sys/devices/virtual/powercap по умолчанию, а зоны
+      # RAPL (energy_uj для cpu_power) живут именно там; /sys/class/powercap
+      # внутри контейнера — битые symlink'ы. Read-only bind-mount снимает
+      # маску; на машинах без RAPL каталога просто не будет (не мешает).
+      - /sys/devices/virtual/powercap:/sys/devices/virtual/powercap:ro
     device_cgroup_rules:
       - 'c 189:* rwm'      # char-устройства USB (major 189)
     devices:
-      # LED-лента CH340
-      - /dev/ttyUSB0
+      # LED-лента CH340. Если на хосте она сидит НЕ на ttyUSB0 (проверка:
+      # ls /dev/ttyUSB* на хосте), задайте её узел переменной LED_DEVICE —
+      # в контейнере она всегда будет видна как /dev/ttyUSB0:
+      #   LED_DEVICE=/dev/ttyUSB1 docker compose up -d --build
+      - ${LED_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0

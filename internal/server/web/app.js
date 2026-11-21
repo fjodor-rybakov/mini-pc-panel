@@ -104,6 +104,31 @@ function draw() {
   for (const w of curScreen().widgets) drawWidget(w, z, bg);
   const sel = curWidget();
   if (sel) drawSelection(sel, z);
+  schedulePreview();
+}
+
+// Живое превью «как видит экран»: драфт рендерится на сервере (POST
+// /api/render) БЕЗ касания панели - картинка в футере обновляется сама,
+// не дожидаясь «Применить» или «Примерить». Дебаунс 500 мс; запоздалые
+// ответы старше последнего запроса отбрасываются (seq).
+let previewSeq = 0, previewTimer = null;
+function schedulePreview() {
+  if (!state.draft) return;
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    const seq = ++previewSeq;
+    try {
+      const r = await fetch(`/api/render?screen=${state.screenIdx}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.draft),
+      });
+      if (r.status !== 200 || seq !== previewSeq) return;
+      const old = $("#previewImg").src;
+      $("#previewImg").src = URL.createObjectURL(await r.blob());
+      if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+    } catch (_) { /* панель недоступна - следующая правка повторит */ }
+  }, 500);
 }
 
 // drawGrid paints the coordinate grid the widgets are oriented against:
@@ -155,16 +180,38 @@ function drawWidget(w, z, bg) {
 
   switch (w.type) {
     case "text": {
-      const size = (w.font && w.font.size ? w.font.size : 13) * z;
-      ctx.font = `${w.font && w.font.bold ? "bold " : ""}${size}px "Latin Modern Sans", sans-serif`;
+      // Mirrors the Go renderer (internal/render/widgets.go drawTextWidget):
+      // size is true panel pixels, the first baseline sits at rect.top +
+      // ascent (TOP anchoring, NOT vertically centred), lines advance by the
+      // font's own line height, words wrap at the rect width, and everything
+      // outside the rect is CLIPPED (the panel rasterises each text widget
+      // on a rect-sized sub-canvas, same clip, like the original text.js).
+      const bold = !!(w.font && w.font.bold);
+      const size = (w.font && w.font.size ? w.font.size : 20) * z;
+      ctx.font = `${bold ? "bold " : ""}${size}px "Latin Modern Sans", sans-serif`;
       ctx.fillStyle = w.color || "#ffffff";
-      ctx.textBaseline = "middle";
+      ctx.textBaseline = "alphabetic";
       ctx.textAlign = w.align === "center" ? "center" : w.align === "right" ? "right" : "left";
-      const tx = w.align === "center" ? x + ww / 2 : w.align === "right" ? x + ww : x + 2;
-      const lines = fmt(w).split("\n");
-      const lh = size * 1.2;
-      const y0 = y + hh / 2 - ((lines.length - 1) * lh) / 2;
-      lines.forEach((ln, i) => ctx.fillText(ln, tx, y0 + i * lh));
+      // Latin Modern hhea metrics / unitsPerEm (1000) - the same TTF the
+      // device rasterises, served from web/fonts/ via @font-face.
+      const m = bold ? { asc: 1.134, lh: 1.431 } : { asc: 1.154, lh: 1.463 };
+      const tx = w.align === "center" ? x + ww / 2 : w.align === "right" ? x + ww : x;
+      const lines = [];
+      for (const raw of fmt(w).split("\n")) {
+        let cur = "";
+        for (const word of raw.split(" ")) {
+          const cand = cur ? cur + " " + word : word;
+          if (cur && ctx.measureText(cand).width > ww) { lines.push(cur); cur = word; }
+          else cur = cand;
+        }
+        lines.push(cur);
+      }
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, ww, hh);
+      ctx.clip();
+      lines.forEach((ln, i) => ctx.fillText(ln, tx, y + size * m.asc + i * size * m.lh));
+      ctx.restore();
       break;
     }
     case "doughnut":
@@ -469,7 +516,7 @@ function buildProps() {
       props.append(row("формат", txt(w.format, (v) => { w.format = v; draw(); })));
       props.append(row("цвет", col(w.color, (v) => { w.color = v; draw(); })));
       props.append(row("выравнивание", sel([["left", "слева"], ["center", "центр"], ["right", "справа"]], w.align, (v) => { w.align = v; draw(); })));
-      w.font = w.font || { family: "", size: 13, bold: false };
+      w.font = w.font || { family: "", size: 20, bold: false };
       props.append(row("размер шрифта", num(w.font.size, (v) => { w.font.size = v; draw(); })));
       props.append(row("полужирный", chk(w.font.bold, (v) => { w.font.bold = v; draw(); })));
       props.append(row("фон прямоугольника", col(w.fill, (v) => { w.fill = v; draw(); })));
@@ -726,7 +773,11 @@ $("#ledApply").addEventListener("click", async () => {
     intensity: parseInt($("#ledInt").value, 10),
     speed: parseInt($("#ledSpd").value, 10),
   });
-  status(res.status === 200 ? "LED отправлен" : "LED: ошибка " + (res.json && res.json.error ? res.json.error : res.status));
+  if (res.status === 200) {
+    status("LED-лента: режим применён" + (res.json && res.json.saved ? " и сохранён в config.json" : " (в config не сохранён!)"));
+  } else {
+    status("LED: ошибка " + (res.json && res.json.error ? res.json.error : res.status));
+  }
 });
 
 function syncThemeCtl() {
@@ -749,8 +800,8 @@ function normalizeDraft() {
     for (const w of sc.widgets) {
       w.type = w.type || "text";
       w.color = w.color || "#ffffff";
-      w.font = w.font || { family: "", size: 13, bold: false };
-      w.font.size = w.font.size || 13;
+      w.font = w.font || { family: "", size: 20, bold: false };
+      w.font.size = w.font.size || 20;
     }
   }
 }
@@ -792,3 +843,8 @@ async function boot() {
 }
 
 boot().catch((e) => status("Не удалось загрузить состояние: " + e));
+
+// @font-face faces load asynchronously; redraw once they are available so
+// the editor canvas measures and rasterises with the same Latin Modern the
+// device embeds (metrics constants in drawWidget assume it).
+if (document.fonts) document.fonts.ready.then(() => draw());

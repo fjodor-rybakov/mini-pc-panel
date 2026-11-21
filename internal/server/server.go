@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
@@ -42,6 +43,7 @@ type Panel interface {
 	PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx int) (*render.Frame, error)
 	ApplyLEDManual(s config.LEDSettings) error
 	ManualLED() (config.LEDSettings, bool)
+	PersistLED(s config.LEDSettings) error
 	NextScreen()
 	ShowScreen(id int) bool
 	PauseRotation(on bool)
@@ -64,11 +66,12 @@ func New(a Panel, addr string) *Server {
 	if err != nil {
 		panic("server: embed: " + err.Error())
 	}
-	s.mux.Handle("/", http.FileServer(http.FS(sub)))
+	s.mux.Handle("/", noCache(http.FileServer(http.FS(sub))))
 	s.mux.HandleFunc("GET /api/state", s.handleState)
 	s.mux.HandleFunc("GET /api/poll", s.handlePoll)
 	s.mux.HandleFunc("GET /api/theme", s.handleTheme)
 	s.mux.HandleFunc("POST /api/preview", s.handlePreview)
+	s.mux.HandleFunc("POST /api/render", s.handleRender)
 	s.mux.HandleFunc("POST /api/apply", s.handleApply)
 	s.mux.HandleFunc("POST /api/led", s.handleLED)
 	s.mux.HandleFunc("GET /api/themes", s.handleThemes)
@@ -78,14 +81,53 @@ func New(a Panel, addr string) *Server {
 	return s
 }
 
+// noCache forces the browser to revalidate editor assets on every load.
+// Embedded files carry a zero modTime, so http.FileServer emits no usable
+// Last-Modified/ETag and browsers fall back to heuristic caching - after an
+// image rebuild the editor kept running stale app.js (its buttons then hit
+// the old code paths, which is exactly how "админка не может поменять
+// режим" looks from the browser).
+func noCache(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		h.ServeHTTP(w, r)
+	})
+}
+
 // ListenAndServe runs the editor HTTP server (blocking).
 func (s *Server) ListenAndServe() error {
 	s.httpSrv = &http.Server{
 		Addr:              s.addr,
-		Handler:           s.mux,
+		Handler:           logRequests(s.mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s.httpSrv.ListenAndServe()
+}
+
+// logRequests echoes every /api call into the daemon log. When the editor
+// "does nothing", the log answers whether the browser sent the request at
+// all (and with what status) - no browser devtools needed.
+func logRequests(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		rec := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(rec, r)
+		log.Printf("server: %s %s -> %d", r.Method, r.URL.Path, rec.status)
+	})
+}
+
+// statusWriter remembers the response code for logRequests.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // Shutdown stops the editor server gracefully (in-flight handlers get to
@@ -339,6 +381,33 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleRender validates the draft and replies with its PNG WITHOUT
+// touching the hardware (unlike /api/preview, which pushes a full redraw
+// to the physical panel). The editor refreshes the footer "как видит экран"
+// thumbnail with it live while editing, so the picture no longer waits for
+// an apply or a preview push.
+func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
+	idx, err := screenParam(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	t, err := readDraft(r)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	frame, err := s.app.PreviewFrame(t, idx)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	if err := frame.WritePNG(w); err != nil {
+		log.Printf("server: render png: %v", err)
+	}
+}
+
 // handleApply hot-swaps the live theme (the daemon forces a full redraw on
 // the next poll); ?save=1 additionally writes the theme file.
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -376,11 +445,22 @@ func (s *Server) handleLED(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("led theme must be 1..6, got %d", settings.Theme))
 		return
 	}
+	// Persist before touching the port, like the original set_led_strip
+	// (s1panel/api.js:309-316) which rewrote the led block in config.json
+	// on every apply: an "off" must survive a daemon/container restart even
+	// if the CH340 is currently unreachable. A save failure is logged and
+	// reported as saved:false, not fatal — the strip still gets the frame.
+	saved := false
+	if err := s.app.PersistLED(settings); err != nil {
+		log.Printf("server: led settings not saved: %v", err)
+	} else {
+		saved = true
+	}
 	if err := s.app.ApplyLEDManual(settings); err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "saved": saved})
 }
 
 func screenParam(r *http.Request) (int, error) {

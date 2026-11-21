@@ -159,3 +159,32 @@ func TestWriteFramePropagatesErrors(t *testing.T) {
 		t.Errorf("error %v does not wrap the port error", err)
 	}
 }
+
+// PickPort must outrank the literal config value with the CH340's USB
+// identity when they disagree (wrong ttyUSB index = "off" written to the
+// wrong adapter), but never guess between zero or several CH340s.
+func TestPickPort(t *testing.T) {
+	ch340 := PortInfo{Name: "/dev/ttyUSB1", VID: "1a86", PID: "7523"}
+	other := PortInfo{Name: "/dev/ttyUSB0", VID: "067B", PID: "2303"}
+	ports := []PortInfo{other, ch340}
+
+	if name, note := PickPort("/dev/ttyUSB0", ports); name != "/dev/ttyUSB1" || note == "" {
+		t.Errorf("configured port is not CH340: got (%q, %q), want the CH340 + a note", name, note)
+	}
+	if name, note := PickPort("/dev/ttyUSB9", ports); name != "/dev/ttyUSB1" || note == "" {
+		t.Errorf("configured port absent: got (%q, %q), want the CH340 + a note", name, note)
+	}
+	if name, note := PickPort("/dev/ttyUSB1", ports); name != "/dev/ttyUSB1" || note != "" {
+		t.Errorf("configured port IS the CH340: got (%q, %q), want it untouched and silent", name, note)
+	}
+	if name, note := PickPort("/dev/ttyUSB0", []PortInfo{other}); name != "/dev/ttyUSB0" || note != "" {
+		t.Errorf("no CH340 visible: got (%q, %q), want configured port untouched", name, note)
+	}
+	two := []PortInfo{ch340, {Name: "/dev/ttyUSB2", VID: "1A86", PID: "7523"}}
+	if name, note := PickPort("/dev/ttyUSB0", two); name != "/dev/ttyUSB0" || note != "" {
+		t.Errorf("two CH340s (ambiguous): got (%q, %q), want configured port untouched", name, note)
+	}
+	if !IsCH340(PortInfo{VID: "1A86"}) || IsCH340(PortInfo{VID: "067B"}) {
+		t.Error("IsCH340 must match the vendor id case-insensitively")
+	}
+}

@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -138,6 +139,66 @@ func TestRenderFrameBytes(t *testing.T) {
 	}
 	if !nonBlank(f) {
 		t.Fatal("portrait frame is blank — pre-rotated text rendered nothing")
+	}
+}
+
+// inkBounds returns the bounding box (width, height) of every non-black
+// pixel in the frame (background is #000, text white, one widget per test
+// draft, so anything lit is the glyph).
+func inkBounds(f *Frame) (int, int) {
+	minX, minY, maxX, maxY := 1<<30, 1<<30, -1, -1
+	for y := 0; y < f.Height; y++ {
+		for x := 0; x < f.Width; x++ {
+			off := (y*f.Width + x) * 2
+			if f.Pixels[off]|f.Pixels[off+1] != 0 {
+				if x < minX {
+					minX = x
+				}
+				if x > maxX {
+					maxX = x
+				}
+				if y < minY {
+					minY = y
+				}
+				if y > maxY {
+					maxY = y
+				}
+			}
+		}
+	}
+	return maxX - minX + 1, maxY - minY + 1
+}
+
+// Font.Size counts panel pixels, exactly like the original text.js
+// ('20px Arial' on node-canvas). Regression guard: canvas Font.Face wants
+// PostScript POINTS; passing the raw px number made every glyph ~2.83x too
+// small on the device while the browser editor showed true px - the exact
+// "editor much bigger than the panel" mismatch. Ink of two digits at size S
+// is ~1em wide and ~0.7em tall; at px/points confusion both collapse.
+func TestTextFontSizeIsPixelsNotPoints(t *testing.T) {
+	rd := sampleReadings() // renders "42"
+	inkAt := func(size int) (int, int) {
+		draft := fmt.Sprintf(`{"orientation":"landscape","screens":[{"id":1,"widgets":[{"id":1,"type":"text","rect":{"x":0,"y":0,"width":300,"height":120},"sensor":"cpu","format":"{0}","font":{"size":%d}}]}]}`, size)
+		th, err := config.ParseTheme([]byte(draft))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := Render(&th.Screens[0], th, 320, 170, false, rd, NewFonts(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inkBounds(f)
+	}
+	w40, h40 := inkAt(40)
+	if w40 < 28 || w40 > 56 { // [0.7, 1.4]*40
+		t.Errorf("ink of \"42\" at 40px is %d wide, want 28..56 (px treated as points? that gives ~15)", w40)
+	}
+	if h40 < 18 || h40 > 38 { // [0.45, 0.95]*40, digit height ~0.7em
+		t.Errorf("ink of \"42\" at 40px is %d tall, want 18..38", h40)
+	}
+	w10, _ := inkAt(10)
+	if r := float64(w40) / float64(w10); r < 3.0 || r > 5.0 {
+		t.Errorf("ink width ratio 40px/10px = %.2f, want ~4 (size must scale glyph)", r)
 	}
 }
 

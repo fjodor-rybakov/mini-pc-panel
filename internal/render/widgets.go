@@ -16,6 +16,7 @@ import (
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/config"
 	"github.com/fjodor-rybakov/mini-pc-panel/internal/metrics"
 	"github.com/tdewolff/canvas"
+	"github.com/tdewolff/canvas/renderers/rasterizer"
 )
 
 // drawWidget renders one theme widget into the current view (portrait themes
@@ -79,7 +80,12 @@ func drawTextWidget(ctx *canvas.Context, w config.Widget, rd map[string]metrics.
 	if col == "" {
 		col = "#ffffff" // text.js line 43 fallback 'white'
 	}
-	face := ft.Face(size, canvas.Hex(col))
+	// canvas Font.Face takes PostScript POINTS (internally size*25.4/72 mm),
+	// but theme configs count pixels exactly like the original text.js
+	// ("20px Arial" on node-canvas). At DPMM(1.0) one canvas unit = one mm =
+	// one panel pixel, so a 48px font must be handed over as 48*72/25.4 pt;
+	// passing the raw px number silently renders every glyph ~2.83x too small.
+	face := ft.Face(size*72.0/25.4, canvas.Hex(col))
 	halign := canvas.Left
 	switch w.Align {
 	case "center":
@@ -87,8 +93,26 @@ func drawTextWidget(ctx *canvas.Context, w config.Widget, rd map[string]metrics.
 	case "right":
 		halign = canvas.Right
 	}
-	text := canvas.NewTextBox(face, FormatTokens(w, rd), float64(w.Rect.Width), float64(w.Rect.Height), halign, canvas.Top, nil)
-	ctx.DrawText(float64(w.Rect.X), float64(w.Rect.Y), text)
+	ww, hh := float64(w.Rect.Width), float64(w.Rect.Height)
+	if ww <= 0 || hh <= 0 {
+		return nil
+	}
+	// A tdewolff TextBox silently DROPS every line whose line box (about
+	// 1.46em for Latin Modern) does not fit the box height - a 20px font in
+	// a 20px-tall rect, which the shipped themes are full of, would render
+	// nothing at all. The original text.js had no such rule: node-canvas
+	// clipped glyph drawing to the widget rect (start_draw's clip), so the
+	// part of the glyphs inside the rect was always visible. Reproduce that
+	// clip semantics: lay out all lines with an unbounded box height on a
+	// transparent rect-sized sub-canvas, rasterise it 1:1 and paste it back
+	// at the rect origin - the sub-canvas bounds are the clip. The editor
+	// (web/app.js drawWidget "text") applies the same ctx.rect+clip.
+	sub := canvas.New(ww, hh)
+	sctx := canvas.NewContext(sub)
+	sctx.SetCoordSystem(canvas.CartesianIV)
+	text := canvas.NewTextBox(face, FormatTokens(w, rd), ww, 1e6, halign, canvas.Top, nil)
+	sctx.DrawText(0, 0, text)
+	ctx.DrawImage(float64(w.Rect.X), float64(w.Rect.Y), rasterizer.Draw(sub, canvas.DPMM(1.0), canvas.DefaultColorSpace), canvas.DPMM(1.0))
 	return nil
 }
 

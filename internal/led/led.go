@@ -5,9 +5,11 @@ package led
 import (
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"go.bug.st/serial"
+	"go.bug.st/serial/enumerator"
 )
 
 // Protocol constants (spec §4).
@@ -113,6 +115,12 @@ func writeFrame(s frameSink, frame []byte, sleep func(time.Duration)) error {
 // Device writes LED commands to the CH340 serial port.
 type Device struct {
 	port serial.Port
+
+	// Name/VID/PID describe the port actually opened (for logs; a wrong tty
+	// index is the classic "off went somewhere else" failure).
+	Name string
+	VID  string
+	PID  string
 }
 
 // Open attaches to the serial port (e.g. "/dev/ttyUSB0") at 10000 baud 8N1.
@@ -154,4 +162,88 @@ func (d *Device) Close() error {
 		return nil
 	}
 	return d.port.Close()
+}
+
+// PortInfo is one enumerated serial port with its USB identity - the strip
+// hangs off a CH340 (VID 1a86), which is how to tell it apart from other
+// USB-serial adapters that shift the ttyUSB index.
+type PortInfo struct {
+	Name string
+	VID  string
+	PID  string
+}
+
+// IsCH340 reports the vendor id of the LED link.
+func IsCH340(p PortInfo) bool { return strings.EqualFold(p.VID, "1a86") }
+
+// ListPorts enumerates serial ports with USB ids. The kernel sysfs data it
+// reads is visible inside containers too, so this also answers "did the
+// docker device mapping actually deliver the CH340?".
+func ListPorts() ([]PortInfo, error) {
+	dl, err := enumerator.GetDetailedPortsList()
+	if err != nil {
+		return nil, fmt.Errorf("led: enumerate: %w", err)
+	}
+	out := make([]PortInfo, 0, len(dl))
+	for _, p := range dl {
+		out = append(out, PortInfo{Name: p.Name, VID: p.VID, PID: p.PID})
+	}
+	return out, nil
+}
+
+// PickPort decides which port to open. The wrong tty index is the classic
+// silent failure ("off" written to some other adapter, the strip stays
+// lit), so USB identity outranks the literal config value: when the
+// configured port is missing or is not a CH340 and exactly one CH340 is
+// visible, that one wins and note explains the switch. With zero or
+// several CH340s the configured value is kept untouched.
+func PickPort(configured string, ports []PortInfo) (name, note string) {
+	var ch340 []PortInfo
+	var foundVID string
+	found := false
+	for _, p := range ports {
+		if p.Name == configured {
+			found = true
+			foundVID = p.VID
+			if IsCH340(p) {
+				return configured, "" // exactly what was asked for
+			}
+		}
+		if IsCH340(p) {
+			ch340 = append(ch340, p)
+		}
+	}
+	if len(ch340) == 1 {
+		if found {
+			return ch340[0].Name, fmt.Sprintf("configured port %s is not a CH340 (VID=%s, PID=%s); using the CH340 at %s instead", configured, foundVID, "", ch340[0].Name)
+		}
+		return ch340[0].Name, fmt.Sprintf("configured port %s is not present; using the CH340 at %s", configured, ch340[0].Name)
+	}
+	return configured, ""
+}
+
+// OpenAuto resolves the strip port by USB identity first (see PickPort),
+// then opens it like Open. A wrong ttyUSB index in config.json or in the
+// docker device mapping therefore self-heals instead of silently talking
+// to the wrong adapter; note reports any substitution for the daemon log.
+func OpenAuto(configured string) (*Device, string, error) {
+	name, note := configured, ""
+	ports, perr := ListPorts()
+	if perr != nil {
+		note = "port enumeration failed, using the configured port as-is"
+	} else {
+		name, note = PickPort(configured, ports)
+	}
+	d, err := Open(name)
+	if err != nil {
+		return nil, name, err
+	}
+	d.Name = name
+	for _, p := range ports {
+		if p.Name == name {
+			d.VID, d.PID = p.VID, p.PID
+			break
+		}
+	}
+	return d, note, nil
 }
