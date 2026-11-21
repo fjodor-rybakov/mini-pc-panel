@@ -275,7 +275,7 @@ func TestCPUPowerRAPLDeltas(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(zone, "max_energy_range_uj"), []byte("4000000"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := CPUPower(rapl, fakeHWmonTree(t), []string{"coretemp"}, []string{"Package power"}, 4)
+	s := CPUPower([]string{rapl}, fakeHWmonTree(t), []string{"coretemp"}, []string{"Package power"}, 4)
 	rd, err := s.Sample()
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +317,21 @@ func TestCPUPowerRAPLDeltas(t *testing.T) {
 	}
 }
 
+// Docker's powercap mask can survive a bind-mount at the canonical path, so
+// the first root may be empty while the host has RAPL: the sensor must find
+// zones at the next configured root (docker-compose's /powercap fallback).
+func TestCPUPowerFallbackRAPLRoot(t *testing.T) {
+	rapl := fakePowercapTree(t, "1000000")
+	s := CPUPower([]string{t.TempDir(), rapl}, fakeHWmonTree(t), nil, nil, 4)
+	rd, err := s.Sample()
+	if err != nil {
+		t.Fatalf("second root has zones; hwmon fallback must not be used: %v", err)
+	}
+	if rd.Value != 0 {
+		t.Fatalf("first sample = %v, want 0 (no previous counters)", rd.Value)
+	}
+}
+
 // Sub-zones (intel-rapl:N:M) report energy that is already inside the
 // parent top-level zone (intel-rapl:N); summing both double counts. Zone
 // dir names contain ':' which NTFS forbids, so this runs on Linux hosts
@@ -342,7 +357,7 @@ func TestCPUPowerSkipsSubZones(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sub, "energy_uj"), []byte("1000000"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := CPUPower(root, t.TempDir(), nil, nil, 4)
+	s := CPUPower([]string{root}, t.TempDir(), nil, nil, 4)
 	if _, err := s.Sample(); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +403,7 @@ func TestCPUPowerHwmonFallbackChipPriority(t *testing.T) {
 	root := t.TempDir()
 	writeHWmon(t, root, "hwmon0", "nvme", map[string]string{"power1_label": "Power 1", "power1_input": "5000000"})
 	writeHWmon(t, root, "hwmon1", "coretemp", map[string]string{"power1_input": "15000000"})
-	s := CPUPower(t.TempDir(), root, []string{"coretemp", "nvme"}, []string{"NoSuchPowerLabel"}, 1)
+	s := CPUPower([]string{t.TempDir()}, root, []string{"coretemp", "nvme"}, []string{"NoSuchPowerLabel"}, 1)
 	rd, err := s.Sample()
 	if err != nil {
 		t.Fatal(err)
@@ -401,7 +416,7 @@ func TestCPUPowerHwmonFallbackChipPriority(t *testing.T) {
 func TestCPUPowerHwmonFallback(t *testing.T) {
 	// No RAPL zones: the Go port additionally reads hwmon power*_input µW
 	// (extension; the original reported 0 W).
-	s := CPUPower(t.TempDir(), fakeHWmonTree(t), []string{"coretemp"}, []string{"Package power"}, 1)
+	s := CPUPower([]string{t.TempDir()}, fakeHWmonTree(t), []string{"coretemp"}, []string{"Package power"}, 1)
 	rd, err := s.Sample()
 	if err != nil {
 		t.Fatal(err)

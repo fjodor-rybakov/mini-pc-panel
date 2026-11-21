@@ -121,7 +121,12 @@ func BuildRegistry(cfg *config.Config) *metrics.Registry {
 		Fahrenheit: cfg.Sensors.Fahrenheit,
 		MaxPoints:  maxPoints,
 	}))
-	s = append(s, metrics.CPUPower("/sys/class/powercap", "/sys/class/hwmon",
+	// /powercap is docker-compose's bind-mount of
+	// /sys/devices/virtual/powercap: Docker masks that canonical path and
+	// some versions re-apply the mask over a bind-mount at the SAME path,
+	// so the canonical root can be empty while the host has RAPL. The
+	// nested root covers the vendor dir under powercap (intel-rapl/...).
+	s = append(s, metrics.CPUPower([]string{"/sys/class/powercap", "/powercap", "/powercap/intel-rapl"}, "/sys/class/hwmon",
 		cfg.Sensors.HwmonChips, cfg.Sensors.HwmonPowerLabels, maxPoints))
 	return metrics.NewRegistry(s...)
 }

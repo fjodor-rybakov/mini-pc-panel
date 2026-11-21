@@ -13,10 +13,13 @@ services:
       # Дем сам выбирает экранный интерфейс панели (см. README).
       - /dev/bus/usb:/dev/bus/usb
       # Docker маскирует /sys/devices/virtual/powercap по умолчанию, а зоны
-      # RAPL (energy_uj для cpu_power) живут именно там; /sys/class/powercap
-      # внутри контейнера — битые symlink'ы. Read-only bind-mount снимает
-      # маску; на машинах без RAPL каталога просто не будет (не мешает).
-      - /sys/devices/virtual/powercap:/sys/devices/virtual/powercap:ro
+      # RAPL (energy_uj для cpu_power) живут именно там; без этого mount'а
+      # /sys/class/powercap внутри контейнера — битые symlink'ы и датчик
+      # даёт cpu_power: N/A. ЦЕЛЬ — не канонический путь, а /powercap:
+      # часть версий Docker перекладывает маску ПОВЕРХ bind-mount на исходном
+      # пути. Дем сканирует /powercap как запасной корень (metrics.CPUPower);
+      # на машинах без RAPL каталога просто не будет (не мешает).
+      - /sys/devices/virtual/powercap:/powercap:ro
     device_cgroup_rules:
       - 'c 189:* rwm'      # char-устройства USB (major 189)
     devices:

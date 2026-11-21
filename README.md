@@ -308,9 +308,12 @@ true, "theme": 4 }` в `panel-data/config.json`, затем `docker compose rest
   (`coretemp, k10temp, zenpower, rapl, cpu_thermal, acpitz, nvme`) —
   чип `rapl` это hwmon-представление RAPL в новых ядрах; мощность NVMe
   больше не попадёт в `cpu_power`. В Docker учтено отдельно: он маскирует
-  `/sys/devices/virtual/powercap`, и без read-only bind-mount этого каталога
-  (есть в `docker-compose.yml`) RAPL-зон в контейнере не видно — датчик
-  давал `cpu_power: N/A`.
+  `/sys/devices/virtual/powercap`, и без mount'а этого каталога RAPL-зон в
+  контейнере не видно — датчик давал `cpu_power: N/A`. В `docker-compose.yml`
+  каталог примонтирован на **неканонический** путь `/powercap` (часть версий
+  Docker перекладывает маску поверх mount'а на исходном пути), а датчик при
+  поиске зон перебирает корни `/sys/class/powercap`, `/powercap` и
+  `/powercap/intel-rapl`.
 - Валидация конфига строгая: `vid`/`pid` — целые в диапазоне 0..65535
   (обрезки не будет), относительные пути тем не могут выходить за каталог
   конфига, `led.theme` 1..6 и `led.intensity`/`led.speed` 1..5,

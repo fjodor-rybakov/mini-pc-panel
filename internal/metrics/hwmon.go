@@ -109,7 +109,9 @@ func celsiusToFahrenheit(c float64) float64 { return c*9/5 + 32 }
 // ---- cpu_power (s1panel/sensors/cpu_power.js) ----
 
 // CPUPower returns a Sensor named "cpu_power": CPU package power draw in
-// watts, primary source /sys/class/powercap/*/energy_uj (RAPL). Unlike the
+// watts, primary source the first RAPL root that has zones (raplRoots,
+// e.g. /sys/class/powercap; inside Docker also the /powercap fallback
+// mount, see findZones). Unlike the
 // original it pairs zones by path (a zone disappearing no longer shifts a
 // positional pairing), reads only top-level zones (intel-rapl:N) so
 // sub-zones (intel-rapl:N:M) are not double counted, clamps energy_uj
@@ -119,27 +121,27 @@ func celsiusToFahrenheit(c float64) float64 { return c*9/5 + 32 }
 // hwmon power*_input (µW) — an extension; the original reported 0 W then.
 // Format tokens: {0} last watts, {1} history joined (max 28 like the
 // original default doughnut scale).
-func CPUPower(raplRoot, hwmonRoot string, chips, labels []string, maxPoints int) Sensor {
+func CPUPower(raplRoots []string, hwmonRoot string, chips, labels []string, maxPoints int) Sensor {
 	return &powerSensor{
-		raplRoot: raplRoot, hwmonRoot: hwmonRoot,
+		raplRoots: raplRoots, hwmonRoot: hwmonRoot,
 		chips: chips, labels: labels, hist: prefilledRing(maxPoints),
 	}
 }
 
 type powerSensor struct {
-	raplRoot, hwmonRoot string
-	chips, labels       []string
-	hist                *ring
-	prev                map[string]float64 // last energy_uj per zone file
-	prevTime            time.Time
+	raplRoots     []string
+	hwmonRoot     string
+	chips, labels []string
+	hist          *ring
+	prev          map[string]float64 // last energy_uj per zone file
+	prevTime      time.Time
 }
 
 func (powerSensor) Name() string { return "cpu_power" }
 
 func (s *powerSensor) Sample() (Reading, error) {
 	now := time.Now()
-	zones, _ := filepath.Glob(filepath.Join(s.raplRoot, "*", "energy_uj"))
-	zones = onlyTopLevelZones(zones)
+	zones := s.findZones()
 	watts := 0.0
 	if len(zones) > 0 {
 		cur := make(map[string]float64, len(zones))
@@ -185,8 +187,9 @@ func (s *powerSensor) Sample() (Reading, error) {
 		hit, err := findHwmon(s.hwmonRoot, s.chips, s.labels, "power")
 		if err != nil {
 			// Inside Docker the usual cause: the default mask hides
-			// /sys/devices/virtual/powercap (bind-mount it read-only).
-			return Reading{}, fmt.Errorf("cpu_power: no RAPL zones under %s and no hwmon power input on chips %v: %w", s.raplRoot, s.chips, err)
+			// /sys/devices/virtual/powercap (docker-compose.yml bind-mounts
+			// it to /powercap, one of the roots scanned by findZones).
+			return Reading{}, fmt.Errorf("cpu_power: no RAPL zones under %v and no hwmon power input on chips %v: %w", s.raplRoots, s.chips, err)
 		}
 		watts = hit.raw / 1e6 // microwatts -> W
 	}
@@ -199,6 +202,23 @@ func (s *powerSensor) Sample() (Reading, error) {
 		Series:  map[int]Series{1: {Values: vals, Max: 28}},
 		When:    now,
 	}, nil
+}
+
+// findZones scans the configured RAPL roots in priority order; the first
+// root containing zones wins. /sys/class/powercap is the standard layout
+// (symlinked zone dirs); the /powercap roots are docker-compose's fallback
+// bind-mount of /sys/devices/virtual/powercap - some Docker releases
+// re-apply the powercap mask on top of a bind-mount at the canonical path,
+// which left cpu_power at N/A even with the mount present.
+func (s *powerSensor) findZones() []string {
+	for _, root := range s.raplRoots {
+		zones, _ := filepath.Glob(filepath.Join(root, "*", "energy_uj"))
+		zones = onlyTopLevelZones(zones)
+		if len(zones) > 0 {
+			return zones
+		}
+	}
+	return nil
 }
 
 // onlyTopLevelZones keeps RAPL top-level zones (intel-rapl:N) and drops
