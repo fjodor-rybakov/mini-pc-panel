@@ -98,31 +98,35 @@ func (d *Display) worker(ctx context.Context) {
 
 // process runs on the worker goroutine only.
 func (d *Display) process(j *job) {
-	// The 10 ms pause (spec §5.1) is the author's rule for the partial
-	// update STREAM ("sleep a little between updates, otherwise you will
-	// get a send error"). Upstream lcd_device.js feeds redraw chunks
-	// back-to-back - redraw_next chains one write to the next with no
-	// timer, pacing instead by the device's own NAK flow control. Sleeping
-	// between the 27 redraw chunks made every full repaint take
-	// 27*(delay+write) for no benefit.
-	burst := j.label == "redraw"
-	for _, p := range j.packets {
+	// Field evidence (user's panel, Nov 2026): with the upstream
+	// lcd_device.js chaining — redraw chunks back-to-back, paced only by
+	// the device's NAK flow control — all 27 chunks cross the wire
+	// ("all 27 chunks on the wire" in the log below) yet the HT32 never
+	// latches the frame: the screen does not change at all. The 10 ms
+	// pause (spec §5.1) is required by this firmware for redraw chunks
+	// too, not just for the partial-update stream ("sleep a little
+	// between updates, otherwise you will get a send error"). Pacing the
+	// 27 chunks costs ~270 ms extra per full repaint; a frame the panel
+	// actually paints is worth it.
+	for i, p := range j.packets {
 		if err := d.tr.Write(p); err != nil {
 			// The original lcd_thread.js logged and carried on. We log the
 			// same way but also count it: the rest of the job is dropped,
 			// so the panel's framebuffer no longer matches what the caller
 			// believes is on screen (its diff baseline). The poll loop
 			// watches WriteFailures and forces a full redraw after a gap.
-			log.Printf("display: %s: write error: %v", j.label, err)
+			log.Printf("display: %s: write error after %d/%d packet(s): %v", j.label, i, len(j.packets), err)
 			d.mu.Lock()
 			d.writeFails++
 			d.mu.Unlock()
 			return
 		}
-		if !burst {
-			time.Sleep(d.delay) // spec §5.1: pause between update packets
-		}
+		time.Sleep(d.delay) // spec §5.1: pause after every packet, redraw chunks included
 	}
+	// No per-job timing log: the "all N chunks on the wire in Xs" line was a
+	// field-debug aid (proving redraws reach the USB wire) and is now a
+	// 27-chunk line every repaint - noise. Real trouble still logs: the
+	// write-error branch above plus the app's WriteFailures resync latch.
 }
 
 // WriteFailures is the number of jobs abandoned mid-write since startup.

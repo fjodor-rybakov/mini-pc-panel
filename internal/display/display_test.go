@@ -130,13 +130,17 @@ func TestRedrawDelayPausesNextJob(t *testing.T) {
 	d.Close()
 }
 
-// Upstream lcd_device.js redraw_next chains the 27 chunk writes with no
-// timer (the device's NAK flow control paces them); the 10 ms pause is the
-// partial-update rule. Even with packet_delay 50 ms the chunks must burst:
-// if per-chunk sleeps crept back in, this would take at least 27*50 ms.
-func TestRedrawChunksBurstWithoutDelay(t *testing.T) {
+// Field regression (user's panel, Nov 2026): "standby does not black the
+// screen" while the log shows every redraw chunk on the wire. This HT32
+// firmware only latches a full frame when its chunks carry the same
+// inter-packet pause as the partial-update stream (spec §5.1) — the
+// upstream back-to-back chaining silently reaches the wire but never
+// paints. With packet_delay 20 ms the 27 chunks must therefore take at
+// least 26*20 ms; bursts (the old behaviour) are the regression.
+func TestRedrawChunksArePaced(t *testing.T) {
+	const delay = 20 * time.Millisecond
 	tr := newFakeTransport()
-	d := New(tr, 50*time.Millisecond, 20*time.Millisecond)
+	d := New(tr, delay, 20*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.Start(ctx)
@@ -146,8 +150,8 @@ func TestRedrawChunksBurstWithoutDelay(t *testing.T) {
 	}
 	start := time.Now()
 	waitForWrites(t, tr, ChunkCount)
-	if elapsed := time.Since(start); elapsed > 600*time.Millisecond {
-		t.Fatalf("redraw chunks took %v; per-chunk packet_delay crept back in", elapsed)
+	if elapsed := time.Since(start); elapsed < (ChunkCount-1)*delay {
+		t.Fatalf("redraw chunks took %v; they must be paced by packet_delay (%s) on this firmware", elapsed, (ChunkCount-1)*delay)
 	}
 	d.Close()
 }

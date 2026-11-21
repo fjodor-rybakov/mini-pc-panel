@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHexUint16(t *testing.T) {
@@ -145,6 +146,128 @@ func TestLoadRejectsBadLEDValues(t *testing.T) {
 		if _, err := Load(path); err == nil {
 			t.Fatalf("%s accepted; out-of-range led values must fail load", bad)
 		}
+	}
+}
+
+// The standby window is [start, end): start inclusive, end exclusive, and
+// start > end wraps past midnight. Unconfigured or start == end disables it.
+func TestStandbySchedule(t *testing.T) {
+	at := func(h, m int) time.Time { return time.Date(2026, 11, 21, h, m, 0, 0, time.Local) }
+	day := StandbyConfig{Start: "09:00", End: "17:00"}
+	night := StandbyConfig{Start: "23:00", End: "07:00"}
+	for _, tc := range []struct {
+		name string
+		cfg  StandbyConfig
+		h, m int
+		want bool
+	}{
+		{"before window", day, 8, 59, false},
+		{"start inclusive", day, 9, 0, true},
+		{"last active minute", day, 16, 59, true},
+		{"end exclusive", day, 17, 0, false},
+		{"wrap: before window", night, 22, 59, false},
+		{"wrap: start inclusive", night, 23, 0, true},
+		{"wrap: midnight inside", night, 0, 0, true},
+		{"wrap: end exclusive", night, 7, 0, false},
+		{"unset disabled", StandbyConfig{}, 3, 30, false},
+		{"start==end disabled", StandbyConfig{Start: "09:00", End: "09:00"}, 9, 30, false},
+	} {
+		if got := tc.cfg.Active(at(tc.h, tc.m)); got != tc.want {
+			t.Fatalf("%s: Active(%02d:%02d) = %v, want %v", tc.name, tc.h, tc.m, got, tc.want)
+		}
+	}
+	if (StandbyConfig{}).Enabled() || !(StandbyConfig{Start: "23:00"}).Enabled() {
+		t.Fatal("Enabled must be false only when both fields are empty")
+	}
+}
+
+// A half-written or malformed standby block must fail at load: silently
+// disabling standby means the screen stays lit all night, which is exactly
+// the surprise the schedule was added to avoid.
+func TestLoadRejectsBadStandby(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	for _, bad := range []string{
+		`{"theme_file":"t.json","standby":{"start":"25:00","end":"07:00"}}`,
+		`{"theme_file":"t.json","standby":{"start":"23:00","end":"70:00"}}`,
+		`{"theme_file":"t.json","standby":{"start":"23:00"}}`,
+		`{"theme_file":"t.json","standby":{"end":"07:00"}}`,
+	} {
+		if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("%s accepted; malformed standby block must fail load", bad)
+		}
+	}
+	if err := os.WriteFile(path, []byte(`{"theme_file":"t.json","standby":{"start":"23:00","end":"07:00"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("valid standby block rejected: %v", err)
+	}
+	if !cfg.Standby.Active(time.Date(2026, 11, 21, 23, 30, 0, 0, time.Local)) {
+		t.Fatal(`"23:00".."07:00" must be active at 23:30`)
+	}
+}
+
+// SaveStandby is the editor path for the timer ("вынеси в настройку
+// управление временем"): the window must land in config.json so it
+// survives restarts, an empty block means "no timer" and is persistable
+// too ("выключить экран без таймера"), and invalid times must be refused
+// without touching either the file or the in-memory config.
+func TestSaveStandby(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"theme_file":"t.json","standby":{"start":"23:00","end":"07:00"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveStandby(cfg, StandbyConfig{Start: "6:45", End: "8:15"}); err != nil {
+		t.Fatalf("SaveStandby(6:45-8:15): %v", err)
+	}
+	re, err := Load(path)
+	if err != nil {
+		t.Fatalf("config.json after SaveStandby rejected by Load: %v", err)
+	}
+	if re.Standby.Start != "6:45" || re.Standby.End != "8:15" {
+		t.Fatalf("reload = %+v, want 6:45-8:15", re.Standby)
+	}
+	// The rest of the config survives the raw-JSON merge (Load makes
+	// theme_file absolute against the config dir, so compare the base).
+	if filepath.Base(re.ThemeFile) != "t.json" {
+		t.Fatalf("theme_file lost from config.json: %q", re.ThemeFile)
+	}
+	if err := SaveStandby(cfg, StandbyConfig{}); err != nil {
+		t.Fatalf("clearing the timer: %v", err)
+	}
+	re, err = Load(path)
+	if err != nil {
+		t.Fatalf("config.json after clearing rejected: %v", err)
+	}
+	if re.Standby.Enabled() {
+		t.Fatalf("after clearing, reload must report Enabled() false: %+v", re.Standby)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveStandby(cfg, StandbyConfig{Start: "25:00", End: "07:00"}); err == nil {
+		t.Fatal("SaveStandby accepted start \"25:00\"")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("refused SaveStandby must leave config.json byte-identical")
+	}
+	if cfg.Standby.Enabled() {
+		t.Fatalf("refused SaveStandby must not move cfg.Standby either: %+v", cfg.Standby)
 	}
 }
 

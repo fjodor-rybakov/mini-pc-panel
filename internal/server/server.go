@@ -47,6 +47,10 @@ type Panel interface {
 	NextScreen()
 	ShowScreen(id int) bool
 	PauseRotation(on bool)
+	Standby(on bool)
+	StandbyState() bool
+	StandbySchedule() config.StandbyConfig
+	SetStandbySchedule(sc config.StandbyConfig) error
 }
 
 // Server bundles the editor routes; the panel reference gives access to the
@@ -78,6 +82,8 @@ func New(a Panel, addr string) *Server {
 	s.mux.HandleFunc("POST /api/theme", s.handleThemeSwitch)
 	s.mux.HandleFunc("POST /api/next_screen", s.handleNextScreen)
 	s.mux.HandleFunc("POST /api/pause", s.handlePause)
+	s.mux.HandleFunc("POST /api/standby", s.handleStandby)
+	s.mux.HandleFunc("POST /api/standby/schedule", s.handleStandbySchedule)
 	return s
 }
 
@@ -203,6 +209,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			"theme_file": s.app.ThemeFile(),
 			"led":        s.effectiveLED(),
 		},
+		"standby": s.app.StandbyState(),
+		"standby_schedule": func() map[string]any {
+			sch := s.app.StandbySchedule()
+			return map[string]any{"start": sch.Start, "end": sch.End, "enabled": sch.Enabled()}
+		}(),
 	})
 }
 
@@ -349,6 +360,51 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 	}
 	s.app.PauseRotation(on)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "paused": on})
+}
+
+// handleStandby flips software standby (black screen + LED off) the same
+// way /api/pause flips rotation: ?on=true|false in the query. The panel
+// has no power-off command (doc/revrite.md §2), so this is a black full
+// frame and a quiet bus, not a real off. The app goroutine applies it on
+// the next tick; the schedule boundary may flip it back when the standby
+// window opens or closes.
+func (s *Server) handleStandby(w http.ResponseWriter, r *http.Request) {
+	on := true
+	if v := r.URL.Query().Get("on"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		on = b
+	}
+	s.app.Standby(on)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "standby": on})
+}
+
+// handleStandbySchedule sets the standby timer from the editor:
+// {"start":"23:00","end":"07:00"} configures the window, empty start/end
+// remove the timer entirely - standby then stays purely the manual button
+// and no schedule can switch the screen back on. The window is persisted
+// to config.json (like the manual LED apply), so it survives restarts.
+// Malformed times answer 400, same as the config load would.
+func (s *Server) handleStandbySchedule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	sc := config.StandbyConfig{Start: strings.TrimSpace(body.Start), End: strings.TrimSpace(body.End)}
+	if err := s.app.SetStandbySchedule(sc); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "standby_schedule": map[string]any{
+		"start": sc.Start, "end": sc.End, "enabled": sc.Enabled(),
+	}})
 }
 
 // handlePreview validates the draft and pushes it to the physical panel

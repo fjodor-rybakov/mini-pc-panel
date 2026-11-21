@@ -767,6 +767,53 @@ $("#pauseRot").addEventListener("change", async () => {
   }
 });
 
+// Software standby: black frame + LED off (the panel protocol has no
+// power-off command). When a standby timer below is set, its boundary can
+// flip this back on the next daemon tick, so the checkbox is re-synced
+// from /api/state on load. With the timer off, only this button moves it.
+$("#standbySw").addEventListener("change", async () => {
+  const on = $("#standbySw").checked;
+  try {
+    const r = await fetch("/api/standby?on=" + on, { method: "POST" });
+    status(r.status === 200 ? (on ? "Экран выключен (standby: чёрный кадр, лента off)" : "Экран включён: полная перерисовка") : "Standby: ошибка " + r.status);
+  } catch (e) {
+    status("Standby: " + e);
+  }
+});
+
+// Standby timer. Unchecked = no schedule at all: the screen goes black
+// only via the «экран выключен» button and nothing turns it back on.
+// Checked = the HH:MM window is pushed to POST /api/standby/schedule,
+// which persists it to config.json on the daemon (survives restarts).
+async function pushStandbySchedule() {
+  const on = $("#standbyTimerSw").checked;
+  const body = on
+    ? { start: $("#standbyStart").value || "23:00", end: $("#standbyEnd").value || "07:00" }
+    : { start: "", end: "" };
+  try {
+    const r = await fetch("/api/standby/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => null);
+    if (r.status === 200 && j && j.standby_schedule) {
+      $("#standbyStart").value = (j.standby_schedule.start || "").padStart(5, "0");
+      $("#standbyEnd").value = (j.standby_schedule.end || "").padStart(5, "0");
+      status(on
+        ? `Таймер standby ${j.standby_schedule.start}–${j.standby_schedule.end}: сохранён в config.json`
+        : "Таймер standby выключен: экран гаснет только кнопкой");
+    } else {
+      status("Таймер standby: ошибка " + (j && j.error ? j.error : r.status));
+    }
+  } catch (e) {
+    status("Таймер standby: " + e);
+  }
+}
+for (const id of ["standbyTimerSw", "standbyStart", "standbyEnd"]) {
+  $("#" + id).addEventListener("change", pushStandbySchedule);
+}
+
 $("#ledApply").addEventListener("click", async () => {
   const res = await postJSON("/api/led", {
     theme: parseInt($("#ledTheme").value, 10),
@@ -825,6 +872,11 @@ async function boot() {
   state.draft = j.theme;
   state.panelScreen = j.current_screen || 0;
   state.screenIdx = Math.min(state.panelScreen, state.draft.screens.length - 1);
+  $("#standbySw").checked = !!j.standby;
+  const sch = j.standby_schedule || {};
+  $("#standbyTimerSw").checked = !!sch.enabled;
+  $("#standbyStart").value = (sch.start || "").padStart(5, "0");
+  $("#standbyEnd").value = (sch.end || "").padStart(5, "0");
   normalizeDraft();
   if (j.config && j.config.led) {
     const led = j.config.led;

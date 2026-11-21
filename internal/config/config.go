@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // HexUint16 decodes a uint16 from a JSON number (31641) or a string
@@ -108,6 +109,70 @@ type ThemeRef struct {
 	File string `json:"config"`
 }
 
+// StandbyConfig schedules the software standby window. The HT32 protocol
+// (doc/revrite.md §2) has NO power-off command, so "screen off" is a black
+// full-frame redraw, a quiet update bus and the LED strip off for the
+// duration. Start/End are local "HH:MM"; start > end wraps past midnight
+// (the 23:00-07:00 night window). Both empty = disabled; the editor button
+// toggles standby outside/inside the window until the next boundary.
+type StandbyConfig struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// parseHHMM accepts "HH:MM" and "H:MM" local clock times.
+func parseHHMM(s string) (int, bool) {
+	i := strings.IndexByte(s, ':')
+	if i <= 0 || i >= len(s)-1 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(s[:i]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// Enabled reports whether a standby window is configured at all.
+func (s StandbyConfig) Enabled() bool { return s.Start != "" || s.End != "" }
+
+// Active reports whether t falls inside the standby window. An unconfigured
+// or start==end window is never active; the boundary is inclusive at start
+// and exclusive at end ([start, end) modulo midnight wrap).
+func (s StandbyConfig) Active(t time.Time) bool {
+	start, ok1 := parseHHMM(s.Start)
+	end, ok2 := parseHHMM(s.End)
+	if !ok1 || !ok2 || start == end {
+		return false
+	}
+	m := t.Hour()*60 + t.Minute()
+	if start < end {
+		return m >= start && m < end
+	}
+	return m >= start || m < end
+}
+
+// Validate rejects a half-written or malformed window ("25:00", a "start"
+// without "end"). An entirely empty block is VALID and means "no timer":
+// standby is then only ever the editor button, and nothing switches the
+// screen back on by itself.
+func (s StandbyConfig) Validate() error {
+	if !s.Enabled() {
+		return nil
+	}
+	if strings.TrimSpace(s.Start) == "" || strings.TrimSpace(s.End) == "" {
+		return fmt.Errorf(`config: standby block needs both start and end as "HH:MM"`)
+	}
+	if _, ok := parseHHMM(s.Start); !ok {
+		return fmt.Errorf(`config: standby start %q is not "HH:MM"`, s.Start)
+	}
+	if _, ok := parseHHMM(s.End); !ok {
+		return fmt.Errorf(`config: standby end %q is not "HH:MM"`, s.End)
+	}
+	return nil
+}
+
 // Config is the top level daemon configuration.
 type Config struct {
 	Device      DeviceConfig         `json:"device"`
@@ -122,6 +187,7 @@ type Config struct {
 	PacketDelay int                  `json:"packet_delay"` // ms between HID packets, spec §5.1 mandates 10
 	Fonts       map[string]FontFiles `json:"fonts"`
 	Sensors     SensorsConfig        `json:"sensors"`
+	Standby     StandbyConfig        `json:"standby"` // software standby window (black screen, LED off)
 
 	// Dir is the directory of the config file; ThemeFile and font paths are
 	// resolved relative to it. Not part of the JSON.
@@ -238,6 +304,44 @@ func SaveLED(cfg *Config, s LEDSettings) error {
 	return nil
 }
 
+// SaveStandby persists the standby window into the config file the daemon
+// loaded, the same raw-JSON merge way as SaveLED, so a timer set from the
+// editor survives restarts. An EMPTY window ("no timer") is valid and is
+// written as an empty block: Enabled() reads it as off, and standby then
+// stays purely the editor button - nothing can switch the screen back on
+// by itself.
+func SaveStandby(cfg *Config, s StandbyConfig) error {
+	if err := s.Validate(); err != nil {
+		return err
+	}
+	if cfg.Path == "" {
+		return fmt.Errorf("config: no config file path recorded, cannot persist standby settings")
+	}
+	raw, err := os.ReadFile(cfg.Path)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("config: parse %s: %w", cfg.Path, err)
+	}
+	block := map[string]any{"start": s.Start, "end": s.End}
+	updated, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	doc["standby"] = updated
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(cfg.Path, append(out, '\n'), 0o644); err != nil {
+		return fmt.Errorf("config: write %s: %w", cfg.Path, err)
+	}
+	cfg.Standby = s // keep the live config in sync with the file
+	return nil
+}
+
 // Load reads and validates the config file at path.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -271,6 +375,9 @@ func Load(path string) (*Config, error) {
 	if err := cfg.validateLED(); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateStandby(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -301,6 +408,14 @@ func (c *Config) validateLED() error {
 		return fmt.Errorf("config: led speed %d out of range 1..5", c.LED.Speed)
 	}
 	return nil
+}
+
+// validateStandby rejects a half-written standby block before the daemon
+// silently runs without one: a "start" without "end" (or an unparseable
+// "25:00") would otherwise read as "no schedule" and never switch off.
+// An entirely absent block stays valid (standby disabled).
+func (c *Config) validateStandby() error {
+	return c.Standby.Validate()
 }
 
 func (c *Config) applyDefaults() {

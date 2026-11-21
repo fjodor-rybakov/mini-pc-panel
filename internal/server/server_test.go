@@ -23,19 +23,22 @@ const validDraft = `{"orientation":"landscape","screens":[{"id":1,"widgets":[{"i
 // fakePanel implements Panel so the HTTP layer is exercised without any
 // HID/serial hardware.
 type fakePanel struct {
-	dir        string
-	cfg        *config.Config
-	theme      *config.Theme
-	swapped    int
-	previews   int
-	next       int
-	shown      []int
-	pauses     []bool
-	lastLED    config.LEDSettings
-	manualLED  *config.LEDSettings
-	ledErr     error
-	savedLED   *config.LEDSettings
-	persistErr error
+	dir          string
+	cfg          *config.Config
+	theme        *config.Theme
+	swapped      int
+	previews     int
+	next         int
+	shown        []int
+	pauses       []bool
+	standbys     []bool
+	standbySet   bool // StandbyState() answer for /api/state
+	standbySched config.StandbyConfig
+	lastLED      config.LEDSettings
+	manualLED    *config.LEDSettings
+	ledErr       error
+	savedLED     *config.LEDSettings
+	persistErr   error
 }
 
 func newPanel(t *testing.T) *fakePanel {
@@ -131,6 +134,23 @@ func (f *fakePanel) ShowScreen(id int) bool {
 }
 
 func (f *fakePanel) PauseRotation(on bool) { f.pauses = append(f.pauses, on) }
+
+func (f *fakePanel) Standby(on bool) {
+	f.standbys = append(f.standbys, on)
+	f.standbySet = on
+}
+
+func (f *fakePanel) StandbyState() bool { return f.standbySet }
+
+func (f *fakePanel) StandbySchedule() config.StandbyConfig { return f.standbySched }
+
+func (f *fakePanel) SetStandbySchedule(sc config.StandbyConfig) error {
+	if err := sc.Validate(); err != nil {
+		return err
+	}
+	f.standbySched = sc
+	return nil
+}
 
 func newTestServer(t *testing.T) (*httptest.Server, *fakePanel) {
 	t.Helper()
@@ -645,6 +665,134 @@ func TestPauseEndpoint(t *testing.T) {
 		if p.pauses[i] != w {
 			t.Fatalf("pauses[%d] = %v, want %v", i, p.pauses[i], w)
 		}
+	}
+}
+
+// /api/standby?on= mirrors /api/pause: same query spelling, same 400 on
+// garbage; /api/state must echo the resulting state so the editor checkbox
+// reloads checked after a restart of the browser.
+func TestStandbyEndpoint(t *testing.T) {
+	ts, p := newTestServer(t)
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{"?on=true", http.StatusOK},
+		{"?on=false", http.StatusOK},
+		{"?on=maybe", http.StatusBadRequest},
+	} {
+		resp, err := http.Post(ts.URL+"/api/standby"+tc.query, "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s: status %d, want %d", tc.query, resp.StatusCode, tc.want)
+		}
+	}
+	want := []bool{true, false}
+	if len(p.standbys) != len(want) {
+		t.Fatalf("Standby calls = %v, want %v", p.standbys, want)
+	}
+	for i, w := range want {
+		if p.standbys[i] != w {
+			t.Fatalf("standbys[%d] = %v, want %v", i, p.standbys[i], w)
+		}
+	}
+
+	resp, err := http.Post(ts.URL+"/api/standby?on=true", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	resp, err = http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Standby bool `json:"standby"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Standby {
+		t.Fatal(`GET /api/state after standby on: "standby" must be true`)
+	}
+}
+
+// The standby timer moved into the editor settings (user: "вынеси в
+// настройку управление временем ... можно было выключить экран без
+// таймера"): POST /api/standby/schedule sets the {start,end} window,
+// empty strings remove the timer entirely (screen off becomes manual
+// only), malformed times must 400 without touching the stored schedule,
+// and /api/state echoes standby_schedule so the controls reload filled.
+func TestStandbyScheduleEndpoint(t *testing.T) {
+	ts, p := newTestServer(t)
+	post := func(body string) int {
+		t.Helper()
+		resp, err := http.Post(ts.URL+"/api/standby/schedule", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := post(`{"start":"22:30","end":"06:00"}`); got != http.StatusOK {
+		t.Fatalf("valid schedule: status %d, want 200", got)
+	}
+	if p.standbySched.Start != "22:30" || p.standbySched.End != "06:00" {
+		t.Fatalf("schedule = %+v, want 22:30-06:00", p.standbySched)
+	}
+	if got := post(`{"start":"25:00","end":"06:00"}`); got != http.StatusBadRequest {
+		t.Fatalf(`schedule with start "25:00": status %d, want 400`, got)
+	}
+	if p.standbySched.Start != "22:30" || p.standbySched.End != "06:00" {
+		t.Fatalf("refused request must not change the schedule: %+v", p.standbySched)
+	}
+	if got := post(`{"start":"","end":""}`); got != http.StatusOK {
+		t.Fatalf("clearing the timer: status %d, want 200", got)
+	}
+	if p.standbySched.Enabled() {
+		t.Fatalf("cleared schedule must report Enabled() false: %+v", p.standbySched)
+	}
+
+	resp, err := http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		StandbySchedule struct {
+			Start   string `json:"start"`
+			End     string `json:"end"`
+			Enabled bool   `json:"enabled"`
+		} `json:"standby_schedule"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.StandbySchedule.Enabled {
+		t.Fatal(`/api/state must report the cleared timer as enabled: false`)
+	}
+	post(`{"start":"23:00","end":"07:00"}`)
+	resp2, err := http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var body2 struct {
+		StandbySchedule struct {
+			Start   string `json:"start"`
+			End     string `json:"end"`
+			Enabled bool   `json:"enabled"`
+		} `json:"standby_schedule"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&body2); err != nil {
+		t.Fatal(err)
+	}
+	if !body2.StandbySchedule.Enabled || body2.StandbySchedule.Start != "23:00" || body2.StandbySchedule.End != "07:00" {
+		t.Fatalf("state after setting the timer: %+v", body2.StandbySchedule)
 	}
 }
 

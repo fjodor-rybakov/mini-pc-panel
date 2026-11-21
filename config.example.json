@@ -12,6 +12,10 @@
     "intensity": 3,
     "speed": 3
   },
+  "standby": {
+    "start": "23:00",
+    "end": "07:00"
+  },
   "theme_file": "themes/demo.json",
   "theme_list": [
     { "name": "Демо", "config": "themes/demo.json" }

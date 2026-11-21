@@ -51,6 +51,12 @@ type App struct {
 	lastBackoffLog time.Time
 	manualLED      *config.LEDSettings // editor-driven LED set (outranks config)
 	lastLEDTheme   int                 // mode the strip now holds (0 = nothing sent)
+	// Standby (software screen-off): the protocol has no power command, so
+	// the screen is a black full redraw, the LED strip is off and the tick
+	// stops rendering until the schedule window ends or the button flips.
+	standbyOn        bool // effective state: button toggle or schedule window
+	standbyApplied   bool // black frame + LED off already pushed to the panel
+	standbySchedPrev bool // schedule membership at the previous check (edge detect)
 }
 
 // New opens the hardware and loads the theme; it does not start traffic yet.
@@ -144,8 +150,10 @@ func (a *App) Run(ctx context.Context) error {
 	}()
 
 	// Build marker for deployment checks ("screen did not change" vs
-	// "an old image is still running"): docker compose logs | grep "pacing v2".
-	log.Printf("app: display pacing v2 (tile-level diff, min-packet split, burst redraw chunks)")
+	// "an old image is still running"): docker compose logs | grep "pacing v4".
+	// v4 = standby outranks the editor preview («Примерить» no longer
+	// repaints the black standby frame).
+	log.Printf("app: display pacing v4 (paced redraw chunks; standby wins over editor preview)")
 
 	// START_COOL_DOWN in main.js: 1000 ms between opening the HID device
 	// and the first command so the descriptors settle.
@@ -160,8 +168,23 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("app: set time: %w", err)
 	}
 
-	// first full frame (startup sequence: orientation -> time -> redraw)
+	// first full frame (startup sequence: orientation -> time -> redraw).
+	// Inside the standby window the very first frame is black: booting at
+	// 23:30 with a 23:00-07:00 schedule must not flash the live screen for
+	// one second before the tick's standby entry blacks it out.
 	a.refresh()
+	if a.cfg.Standby.Active(time.Now()) {
+		a.mu.Lock()
+		a.standbyOn, a.standbySchedPrev, a.standbyApplied = true, true, true
+		a.mu.Unlock()
+		if err := a.disp.Redraw(ctx, make([]byte, display.FrameBytes)); err != nil {
+			return fmt.Errorf("app: initial standby redraw: %w", err)
+		}
+		a.turnStandbyLEDOff()
+		log.Printf("app: standby window active at startup: screen kept black until %s", a.cfg.Standby.End)
+		a.markHeartbeatSent()
+		return a.runLoop(ctx)
+	}
 	frame, err := a.renderCurrent()
 	if err != nil {
 		return err
@@ -172,7 +195,12 @@ func (a *App) Run(ctx context.Context) error {
 	a.setLastFrame(frame)
 	a.applyScreenLED(a.currentScreen())
 	a.markHeartbeatSent()
+	return a.runLoop(ctx)
+}
 
+// runLoop carries the heartbeat/poll tickers of Run, so the standby-at-startup
+// branch and the normal startup branch share one exit path.
+func (a *App) runLoop(ctx context.Context) error {
 	// The original lcd_thread.js does NOT heartbeat on a fixed timer: it
 	// checks the conditions about once per second (see maybeHeartbeat).
 	hbCheck := time.NewTicker(time.Second)
@@ -237,6 +265,7 @@ func (a *App) tick(ctx context.Context) error {
 	// panel no longer matches lastFrame (our diff baseline). Any change in
 	// the failure counter means "assume the worst": latch a full redraw.
 	if fails := a.disp.WriteFailures(); fails != a.lastWriteFails {
+		log.Printf("app: display write failures %d -> %d: panel is out of sync, full redraw queued", a.lastWriteFails, fails)
 		a.lastWriteFails = fails
 		a.mu.Lock()
 		a.forceRedraw = true
@@ -249,7 +278,52 @@ func (a *App) tick(ctx context.Context) error {
 	if expiredPreview {
 		a.previewLED = false
 	}
+	// Standby state: the schedule flips it at the window boundaries (that
+	// edge overrides any manual button toggle), the button flips it in
+	// between. standbyApplied remembers the black frame is on the panel, so
+	// entry happens once and exit latches exactly one full repaint.
+	sched := a.cfg.Standby.Active(time.Now())
+	standby, applied := a.standbyOn, a.standbyApplied
+	if sched != a.standbySchedPrev {
+		a.standbySchedPrev = sched
+		a.standbyOn = sched
+		standby, applied = sched, false
+		log.Printf("app: standby schedule boundary: screen %s", map[bool]string{true: "off", false: "on"}[sched])
+	}
+	if standby {
+		a.standbyApplied = true
+	}
 	a.mu.Unlock()
+
+	// Standby (software screen-off). doc/revrite.md §2 has no power command,
+	// so "off" is one black full frame, the strip dark, and no rotation or
+	// rendering at all; heartbeats keep flowing (separate ticker) and the
+	// editor metrics keep sampling. An active editor preview does NOT delay
+	// standby: a "previewing" draft must never outrank an explicit
+	// screen-off (field report "Экран не выключается" - the black frame was
+	// skipped while the 5 s preview held, then the preview repainted).
+	if standby {
+		if !applied {
+			if n := a.disp.DropPending(); n > 0 {
+				log.Printf("app: dropping %d queued update job(s) before standby black frame", n)
+			}
+			if err := a.disp.Redraw(ctx, make([]byte, display.FrameBytes)); err != nil {
+				return err
+			}
+			a.turnStandbyLEDOff()
+			log.Printf("app: standby on: black frame sent, LED strip off")
+		}
+		a.refresh()
+		return nil
+	}
+	if !standby && applied {
+		a.mu.Lock()
+		a.standbyApplied = false
+		a.forceRedraw = true // panel holds a black frame lastFrame knows nothing about
+		a.mu.Unlock()
+		a.applyScreenLED(a.currentScreen())
+		log.Printf("app: standby off: full repaint and LED restore queued")
+	}
 
 	if dirty {
 		a.applyThemeOrientation(ctx)
@@ -344,10 +418,11 @@ func (a *App) tick(ctx context.Context) error {
 		a.setLastFrame(frame)
 		return nil
 	}
-	// A full redraw is ChunkCount burst packets (no 10 ms pause between
-	// chunks) - fewer packets and one coherent image once most of the
-	// screen moved anyway. Streaming that many tiles band by band is what
-	// reads as lagging strips, so switch to the redraw instead.
+	// A full redraw is ChunkCount packets - fewer than tiling and one
+	// coherent image once most of the screen moved anyway. Streaming that
+	// many tiles band by band is what reads as lagging strips, so switch
+	// to the redraw instead (its chunks are paced like every other packet:
+	// this firmware drops/ignores unpaced redraw chunks).
 	if len(tiles) >= display.ChunkCount {
 		if n := a.disp.DropPending(); n > 0 {
 			log.Printf("app: dropping %d stale queued update job(s) before full redraw", n)
@@ -477,6 +552,60 @@ func (a *App) PauseRotation(on bool) {
 	a.mu.Unlock()
 }
 
+// Standby forces software standby (black screen + strip off) on/off from
+// the editor. Like PauseRotation it only flips the flag: every panel write
+// stays on the Run/tick goroutine, which reacts within cfg.Poll ms. The
+// schedule boundary outranks the button when the window opens or closes.
+func (a *App) Standby(on bool) {
+	a.mu.Lock()
+	if a.standbyOn != on {
+		a.standbyOn = on
+		log.Printf("app: standby %s requested from editor", map[bool]string{true: "on", false: "off"}[on])
+	}
+	a.mu.Unlock()
+}
+
+// StandbyState reports the effective standby state (/api/state feeds the
+// editor checkbox its initial value).
+func (a *App) StandbyState() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.standbyOn
+}
+
+// StandbySchedule returns the configured standby window ("no timer" = both
+// empty), so the editor can refill its schedule controls on load.
+func (a *App) StandbySchedule() config.StandbyConfig {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Standby
+}
+
+// SetStandbySchedule changes the standby timer at runtime: it validates,
+// rewrites config.json (same persistence the manual LED apply uses via
+// SaveLED) and swaps the window into the live config. The next poll tick
+// sees the schedule edge and applies it: a window covering "now" blacks
+// the screen right away; clearing both times removes the timer entirely,
+// after which only the button switches the screen off and nothing - no
+// boundary, no window - ever switches it back on.
+func (a *App) SetStandbySchedule(sc config.StandbyConfig) error {
+	if err := sc.Validate(); err != nil {
+		return err
+	}
+	if err := config.SaveStandby(a.cfg, sc); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.cfg.Standby = sc
+	a.mu.Unlock()
+	if sc.Enabled() {
+		log.Printf("app: standby timer set: %s-%s", sc.Start, sc.End)
+	} else {
+		log.Printf("app: standby timer removed: screen off is manual only")
+	}
+	return nil
+}
+
 func (a *App) firstEnabledIndex() int {
 	for i, sc := range a.theme.Screens {
 		if sc.IsEnabled() {
@@ -588,6 +717,24 @@ func (a *App) applyScreenLEDLocked(sc *config.Screen) {
 			a.lastLEDTheme = s.Theme
 		}
 	}
+}
+
+// turnStandbyLEDOff darkens the strip for the standby window and records
+// ThemeOff as the mode the CH340 now holds, so the standby exit
+// (applyScreenLED) and shutdownLED see what is out there. Port writes go
+// under a.mu like every other LED call.
+func (a *App) turnStandbyLEDOff() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.led == nil {
+		return
+	}
+	if err := a.led.Off(); err != nil {
+		log.Printf("app: standby led off: %v", err)
+		return
+	}
+	a.lastLEDTheme = led.ThemeOff
+	log.Printf("app: standby led: off frame % X -> %s", led.OffPacket(), a.led.Name)
 }
 
 // ApplyLEDManual pushes explicit strip settings (editor "apply LED" action).
@@ -845,6 +992,20 @@ func (a *App) PreviewOnScreen(ctx context.Context, t *config.Theme, screenIdx in
 	frame, err := a.PreviewFrame(t, screenIdx)
 	if err != nil {
 		return nil, err
+	}
+	// Field regression (Nov 2026, "Ничего не поменялось"): the editor's
+	// «Примерить на экран» pushed a full redraw OVER the standby black frame
+	// (log: a second "redraw: all 27 chunks on the wire" seconds after
+	// "standby on"), while standbyApplied stayed true so nothing re-blacked
+	// the panel. Standby wins: still render the frame so the browser gets
+	// its PNG, but never touch the panel or the strip while the screen is
+	// off.
+	a.mu.Lock()
+	standby := a.standbyOn
+	a.mu.Unlock()
+	if standby {
+		log.Printf("app: preview not pushed: standby is on, the screen stays black (turn standby off to preview on hardware)")
+		return frame, nil
 	}
 	if err := a.disp.Redraw(ctx, frame.Pixels); err != nil {
 		return nil, err
